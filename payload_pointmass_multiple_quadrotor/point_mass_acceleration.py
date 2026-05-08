@@ -17,6 +17,7 @@ from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float64MultiArray
 from typing import Dict, List
+from payload_pointmass_multiple_quadrotor.lim_min_multiple_simple import plan_three_quad_point_mass
 
 class PayloadControlMujocoMultiplePointMass(Node):
     def __init__(self):
@@ -25,7 +26,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         # Runtime parameters (mirrors dq_nmpc style parameterization).
         self.declare_parameter('planner.ts', 0.05)
         self.declare_parameter('planner.horizon_time', 2.0)
-        self.declare_parameter('nmpc.jerk_limit', [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        self.declare_parameter('nmpc.jerk_limit', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
         self.declare_parameter('model.norm_regularization_eps', 1e-8)
         self.declare_parameter('model.unit_vector_stabilization_gain', 5.0)
         self.declare_parameter('model.angular_orthogonality_gain', 5.0)
@@ -38,6 +39,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.norm_regularization_eps = float(self.get_parameter('model.norm_regularization_eps').value)
         self.unit_vector_stabilization_gain = float(self.get_parameter('model.unit_vector_stabilization_gain').value)
         self.angular_orthogonality_gain = float(self.get_parameter('model.angular_orthogonality_gain').value)
+        self.reference_start_time = None
 
         # Prediction Node of the NMPC formulation
         print(self.N_prediction)
@@ -57,10 +59,11 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         ## Gains Controller 
         self.kp_min = 10.0
-        self.kv_min = 1.0
-        self.weight_cable_direction = 1.0
-        self.weight_r = 1.0
-        self.weight_acceleration = 1.0
+        self.kv_min = 5.0
+        self.weight_cable_direction = 10.0
+        self.weight_quadrotor_position = 1.0
+        self.weight_r = 0.1
+        self.weight_acceleration = 0.1
         self.norm_constraint_slack_weight = 10.0
         self.unit_vector_norm_tol = 1e-3
 
@@ -112,6 +115,9 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ##  ----------------------------------------------------------------- Funtion Casadi ---------------------------------
         self.payload_to_quadrotor_unit = self.quadrotor_payload_unit_vector_c()
         self.cable_angular_velocity = self.cable_angular_velocity_c()
+        self.quadrotors_position = self.quadrotor_position_c()
+        self.quadrotors_velocity = self.quadrotor_velocity_c()
+        self.tensions = self.cable_tension_c()
         unit_vectors_init = self.payload_to_quadrotor_unit(pos_0, np.hstack((pos_quad_1, pos_quad_2, pos_quad_3)))
         ##  ----------------------------------------------------------------- Funtion Casadi ---------------------------------
 
@@ -132,7 +138,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             q_eq_list=q_eq_list,
         )
 
-        self.tension_min = 0.8*np.array(tensions_eq)
+        self.tension_min = 0.2*np.array(tensions_eq)
         self.tension_max = 5*np.array(tensions_eq)
 
         print("Tensions")
@@ -181,6 +187,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ## Define odometry subscriber
         self.subscriber_payload_ = self.create_subscription(Odometry, "/quadrotor1/payload/odom", self.callback_get_odometry_payload, 10)
         self.publisher_desired_payload = self.create_publisher(Path, "/quadrotor1/payload/desired_path", 10)
+
         self.publisher_cable_angular_velocity = self.create_publisher(
             Float64MultiArray,
             "/payload/cable_angular_velocity",
@@ -200,6 +207,20 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ## TF We can verify cable direction if they make sense or not
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        ## Publisher desired states for quadrotor
+        self.publisher_ref_quadrotor_1 = self.create_publisher(PositionCommand, "/quadrotor1/payload_planner_quadrotor_cmd", 10)
+        self.publisher_prediction_quadrotor_1 = self.create_publisher(Path, "/quadrotor1/predicted_path", 10)
+
+        ## Publisher desired states for quadrotor
+        self.publisher_ref_quadrotor_2 = self.create_publisher(PositionCommand, "/quadrotor2/payload_planner_quadrotor_cmd", 10)
+        self.publisher_prediction_quadrotor_2 = self.create_publisher(Path, "/quadrotor2/predicted_path", 10)
+
+        ## Publisher desired states for quadrotor
+        self.publisher_ref_quadrotor_3 = self.create_publisher(PositionCommand, "/quadrotor3/payload_planner_quadrotor_cmd", 10)
+        self.publisher_prediction_quadrotor_3 = self.create_publisher(Path, "/quadrotor3/predicted_path", 10)
+
+        self.publisher_prediction_payload = self.create_publisher(Path, "payload/predicted_path", 10)
+
         ## Casadi Model multiple quadrotor and paylaod
         self.flag = 0
         self.code_export_directory ="c_generated_code"
@@ -207,19 +228,19 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         ## Define desired Values 
         self.xd = np.zeros((self.n_x, ), dtype=np.double)
-
-        self.xd[0] = 1.0
-        self.xd[1] = 1.0
-        self.xd[2] = 1.0
-
-        self.xd[3] = 0.0
-        self.xd[4] = 0.0
-        self.xd[5] = 0.0
-
-        self.xd[6:15] = self.n_init
-        self.xd[15:24] = self.r_init
         self.ud = np.zeros((self.n_u, ), dtype=np.double)
+        planner_goal = np.array([0.5, 0.0, 1.0], dtype=np.double)
 
+        self.reference_plan = plan_three_quad_point_mass(
+            p0=pos_0,
+            pf=planner_goal,
+            T_total=self.t_N,
+            n_samples=max(self.N_prediction + 1, 201),
+            payload_mass=self.mass,
+            gravity=self.gravity,
+            cable_lengths=np.full((self.robot_num,), self.length, dtype=np.double),
+        )
+        self.update_reference_from_plan(0.0)
         self.timer = self.create_timer(self.ts, self.run)
 
 
@@ -357,6 +378,22 @@ class PayloadControlMujocoMultiplePointMass(Node):
         msg = Float64MultiArray()
         msg.data = np.asarray(unit, dtype=np.double).reshape((self.robot_num * 3,)).tolist()
         self.publisher_cable_direction.publish(msg)
+        return None
+
+    def update_reference_from_plan(self, t_query: float):
+        times = self.reference_plan["t"]
+        idx = int(np.clip(np.searchsorted(times, t_query, side="left"), 0, len(times) - 1))
+
+        self.xd[0:3] = self.reference_plan["payload_p"][idx]
+        self.xd[3:6] = self.reference_plan["payload_v"][idx]
+
+        q_ref = self.reference_plan["q"][:, idx, :]
+        qdot_ref = self.reference_plan["qdot"][:, idx, :]
+        r_ref = np.cross(q_ref, qdot_ref)
+
+        self.xd[6:15] = q_ref.reshape((self.robot_num * 3,))
+        self.xd[15:24] = r_ref.reshape((self.robot_num * 3,))
+        self.ud[:] = self.reference_plan["quad_a"][:, idx, :].reshape((self.robot_num * 3,))
         return None
 
     def callback_get_odometry_drone_1(self, msg):
@@ -751,6 +788,18 @@ class PayloadControlMujocoMultiplePointMass(Node):
         r2_error = r2 - tangent_projector_2 @ r2_d
         r3_error = r3 - tangent_projector_3 @ r3_d
 
+        xq1 = x_p - self.length * n1
+        xq2 = x_p - self.length * n2
+        xq3 = x_p - self.length * n3
+
+        xq1_d = x_p_d - self.length * n1_d
+        xq2_d = x_p_d - self.length * n2_d
+        xq3_d = x_p_d - self.length * n3_d
+
+        xq1_error = xq1 - xq1_d
+        xq2_error = xq2 - xq2_d
+        xq3_error = xq3 - xq3_d
+
 
         #orthogonality_error = ca.dot(n1, r1)
         #tension_expr = self.mass * (
@@ -768,6 +817,9 @@ class PayloadControlMujocoMultiplePointMass(Node):
             + self.weight_cable_direction * (error_n1.T @ error_n1)
             + self.weight_cable_direction * (error_n2.T @ error_n2)
             + self.weight_cable_direction * (error_n3.T @ error_n3)
+            + self.weight_quadrotor_position * (xq1_error.T @ xq1_error)
+            + self.weight_quadrotor_position * (xq2_error.T @ xq2_error)
+            + self.weight_quadrotor_position * (xq3_error.T @ xq3_error)
             + self.weight_r * (r1_error.T @ r1_error)
             + self.weight_r * (r2_error.T @ r2_error)
             + self.weight_r * (r3_error.T @ r3_error)
@@ -781,6 +833,9 @@ class PayloadControlMujocoMultiplePointMass(Node):
             + self.weight_cable_direction * (error_n1.T @ error_n1)
             + self.weight_cable_direction * (error_n2.T @ error_n2)
             + self.weight_cable_direction * (error_n3.T @ error_n3)
+            + self.weight_quadrotor_position * (xq1_error.T @ xq1_error)
+            + self.weight_quadrotor_position * (xq2_error.T @ xq2_error)
+            + self.weight_quadrotor_position * (xq3_error.T @ xq3_error)
             + self.weight_r * (r1_error.T @ r1_error)
             + self.weight_r * (r2_error.T @ r2_error)
             + self.weight_r * (r3_error.T @ r3_error))
@@ -826,7 +881,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
         ocp.solver_options.qp_solver_cond_N = self.N_prediction
-        ocp.solver_options.hessian_approx = "EXACT"
+        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
         ocp.solver_options.integrator_type = "IRK"
         ocp.solver_options.sim_method_num_stages = 4
         ocp.solver_options.sim_method_num_steps = 2
@@ -841,9 +896,173 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ocp.solver_options.regularize_method = "CONVEXIFY"
         return ocp
 
+    def quadrotor_position_c(self):
+        x = ca.MX.sym('x', 3, 1)
+        n = ca.MX.sym('n', 3*self.robot_num, 1)  # general: 3 thrust comps + 3m 'r' comps
+        n_matrix = ca.reshape(n, 3, self.robot_num)
+
+        # unpack state
+        x_p   = x[0:3]      # 3x1
+
+        # Vectorized expression:
+        cols = []
+        for k in range(self.robot_num):
+            quadrotor = x_p - (self.length * n_matrix[:, k])  # 3 x m
+            cols.append(quadrotor)
+
+        quadrotors_location = ca.hcat(cols)             # 3 x m
+        quadrotors_location_vec = ca.reshape(quadrotors_location, 3*self.robot_num, 1)  # (3m) x 1
+        quadrotors_location_funtion = ca.Function('quadrotors_location', [x, n], [quadrotors_location_vec])
+        return quadrotors_location_funtion
+
+    def quadrotor_velocity_c(self):
+
+        x = ca.MX.sym('x', 3, 1)
+
+        n = ca.MX.sym('n', 3*self.robot_num, 1)  # general: 3 thrust comps + 3m 'r' comps
+        n_matrix = ca.reshape(n, 3, self.robot_num)
+
+        w = ca.MX.sym('w', 3*self.robot_num, 1)  # general: 3 thrust comps + 3m 'r' comps
+        w_matrix = ca.reshape(w, 3, self.robot_num)
+
+        # unpack state
+        v_p = x[0:3]
+
+        cols = []
+        for k in range(self.robot_num):
+            r_p = w_matrix[:, k]
+            n_p = n_matrix[:, k]
+            term_n   = self.length * ca.cross(r_p, n_p)
+            v_k      = v_p - term_n     
+            cols.append(v_k)
+
+        quadrotors_velocity = ca.hcat(cols)             # 3 x m
+        quadrotors_velocity_vec = ca.reshape(quadrotors_velocity, 3*self.robot_num, 1)  # (3m) x 1
+        quadrotors_velocity_funtion = ca.Function('quadrotors_velocity', [x, n, w], [quadrotors_velocity_vec])
+        return quadrotors_velocity_funtion
+
+    def publish_prediction(self):
+        # Create one Path message per drone
+        path_msgs = []
+        payload_msgs = []
+
+        # Quadrotors
+        for i in range(self.robot_num):
+            msg = Path()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "world"
+            path_msgs.append(msg)
+        
+        # Payload
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "world"
+        payload_msgs.append(msg)
+        
+        # Fill poses for each drone
+        for k in range(self.N_prediction):
+            x_k = self.acados_ocp_solver.get(k, "x")
+            xq = np.array(self.quadrotors_position(x_k[0:3], x_k[6:15])).reshape((self.robot_num * 3,))
+
+            # Quadrotor positions
+            for i in range(self.robot_num):
+                pose = PoseStamped()
+                pose.header = path_msgs[i].header
+                pose.pose.position.x = xq[3*i + 0]
+                pose.pose.position.y = xq[3*i + 1]
+                pose.pose.position.z = xq[3*i + 2]
+                path_msgs[i].poses.append(pose)
+
+            # Payload positions
+            pose = PoseStamped()
+            pose.header = payload_msgs[0].header
+            pose.pose.position.x = x_k[0]
+            pose.pose.position.y = x_k[1]
+            pose.pose.position.z = x_k[2]
+            payload_msgs[0].poses.append(pose)
+
+        # Publish drone and payload desired path
+        self.publisher_prediction_quadrotor_1.publish(path_msgs[0])
+        self.publisher_prediction_quadrotor_2.publish(path_msgs[1])
+        self.publisher_prediction_quadrotor_3.publish(path_msgs[2])
+        self.publisher_prediction_payload.publish(payload_msgs[0])
+    
+    def send_position_cmd(self, publisher, x, v, a, tension, direction):
+        position_cmd_msg = PositionCommand()
+        position_cmd_msg.position.x = x[0]
+        position_cmd_msg.position.y = x[1]
+        position_cmd_msg.position.z = x[2]
+
+        position_cmd_msg.velocity.x = v[0]
+        position_cmd_msg.velocity.y = v[1]
+        position_cmd_msg.velocity.z = v[2]
+        
+        position_cmd_msg.acceleration.x = a[0]
+        position_cmd_msg.acceleration.y = a[1]
+        position_cmd_msg.acceleration.z = a[2]
+
+        cable_force = tension*direction
+
+        position_cmd_msg.cable_force.x = cable_force[0]
+        position_cmd_msg.cable_force.y = cable_force[1]
+        position_cmd_msg.cable_force.z = cable_force[2]
+
+        publisher.publish(position_cmd_msg)
+        return None
+
+    def cable_tension_c(self):
+        x = ca.MX.sym("x", 24, 1)
+        u = ca.MX.sym("u", 9, 1)
+
+        x_p = x[0:3]
+        v_p = x[3:6]
+
+        n1 = x[6:9]
+        n2 = x[9:12]
+        n3 = x[12:15]
+
+        r1 = x[15:18]
+        r2 = x[18:21]
+        r3 = x[21:24]
+
+        a_1 = u[0:3]
+        a_2 = u[3:6]
+        a_3 = u[6:9]
+
+        N = ca.hcat([n1, n2, n3])
+        U = ca.hcat([a_1, a_2, a_3])
+        W = ca.hcat([r1, r2, r3])
+
+        d_1 = ca.dot(N[:, 0], U[:, 0]) - self.length * ca.dot(W[:, 0], W[:, 0])
+        d_2 = ca.dot(N[:, 1], U[:, 1]) - self.length * ca.dot(W[:, 1], W[:, 1])
+        d_3 = ca.dot(N[:, 2], U[:, 2]) - self.length * ca.dot(W[:, 2], W[:, 2])
+
+        m = self.mass
+        I3 = ca.MX.eye(3)
+        z = ca.MX.zeros(1, 1)
+
+        M = ca.vertcat(
+            ca.hcat([m * I3, n1, n2, n3]),
+            ca.hcat([n1.T, z, z, z]),
+            ca.hcat([n2.T, z, z, z]),
+            ca.hcat([n3.T, z, z, z]),
+        )
+
+        b = ca.vertcat(
+            -m * self.gravity * self.e3,
+            d_1,
+            d_2,
+            d_3,
+        )
+
+        solution = ca.solve(M, b)
+        tensions = solution[3:6]
+        return ca.Function("cable_tensions", [x, u], [tensions])
+
     def prepare(self):
         if self.flag == 0:
             self.flag = 1
+            self.reference_start_time = time.monotonic()
             # Init Optimization Problem
             for k in range(5000):
                 arr_str = np.array2string(self.x_0, precision=3, separator=", ", suppress_small=True)
@@ -864,8 +1083,23 @@ class PayloadControlMujocoMultiplePointMass(Node):
     def run(self):
         self.prepare()
 
+        if not np.all(np.isfinite(self.x_0)):
+            self.get_logger().error("Skipping MPC solve because x_0 contains non-finite values.")
+            return None
+
+        if self.reference_start_time is None:
+            self.reference_start_time = time.monotonic()
+        elapsed = min(time.monotonic() - self.reference_start_time, float(self.reference_plan["t"][-1]))
+        self.update_reference_from_plan(elapsed)
+
         self.acados_ocp_solver.set(0, "lbx", self.x_0)
         self.acados_ocp_solver.set(0, "ubx", self.x_0)
+
+        # Keep the SQP_RTI iterate close to the current measured state.
+        for stage in range(self.N_prediction + 1):
+            self.acados_ocp_solver.set(stage, "x", self.x_0)
+        for stage in range(self.N_prediction):
+            self.acados_ocp_solver.set(stage, "u", self.ud)
 
         # Desired Trajectory of the system
         for j in range(self.N_prediction):
@@ -879,11 +1113,50 @@ class PayloadControlMujocoMultiplePointMass(Node):
         aux_ref_N = np.hstack((yref_N, uref_N))
         self.acados_ocp_solver.set(self.N_prediction, "p", aux_ref_N)
         # Check Solution since there can be possible errors 
-        self.acados_ocp_solver.solve()
+        status = self.acados_ocp_solver.solve()
+        if status != 0:
+            self.get_logger().error(f"acados solver failed with status {status}")
+            return None
 
         # get Control Actions and predictions
         u = self.acados_ocp_solver.get(0, "u")
         x_k = self.acados_ocp_solver.get(1, "x")
+
+        self.publish_prediction()
+        
+        # This compute the position velocity and acceleration of each quadrotor
+        xQ = np.array(self.quadrotors_position(x_k[0:3], x_k[6:15])).reshape((self.robot_num*3, ))
+        xQ_dot = np.array(self.quadrotors_velocity(x_k[3:6], x_k[6:15], x_k[15:24])).reshape((self.robot_num*3, ))
+        xQ_dot_dot = u
+        tensions = self.tensions(x_k, u)
+
+        self.send_position_cmd(
+            self.publisher_ref_quadrotor_1,
+            xQ[0:3],
+            xQ_dot[0:3],
+            xQ_dot_dot[0:3],
+            float(tensions[0]),
+            x_k[6:9],
+        )
+
+        self.send_position_cmd(
+            self.publisher_ref_quadrotor_2,
+            xQ[3:6],
+            xQ_dot[3:6],
+            xQ_dot_dot[3:6],
+            float(tensions[1]),
+            x_k[9:12],
+        )
+
+        self.send_position_cmd(
+            self.publisher_ref_quadrotor_3,
+            xQ[6:9],
+            xQ_dot[6:9],
+            xQ_dot_dot[6:9],
+            float(tensions[2]),
+            x_k[12:15],
+        )
+        self.get_logger().info("Solving the MPC problem")
         self.publish_transforms()
 
 
