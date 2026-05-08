@@ -15,7 +15,7 @@ from acados_template import AcadosOcp, AcadosOcpSolver, AcadosSimSolver, AcadosS
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64, Float64MultiArray
 from typing import Dict, List
 from payload_pointmass_multiple_quadrotor.lim_min_multiple_simple import plan_three_quad_point_mass
 
@@ -54,16 +54,17 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.mass_quad = 1.24
 
         # Cable length
-        self.length = 0.75
+        self.length = 0.76
         self.e3 = ca.DM([0, 0, 1])
 
         ## Gains Controller 
         self.kp_min = 10.0
         self.kv_min = 5.0
         self.weight_cable_direction = 10.0
-        self.weight_quadrotor_position = 1.0
+        self.weight_quadrotor_position = 0.0
+        self.weight_manipulability = 10.0
         self.weight_r = 0.1
-        self.weight_acceleration = 0.1
+        self.weight_acceleration = 5.0
         self.norm_constraint_slack_weight = 10.0
         self.unit_vector_norm_tol = 1e-3
 
@@ -139,7 +140,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         )
 
         self.tension_min = 0.2*np.array(tensions_eq)
-        self.tension_max = 5*np.array(tensions_eq)
+        self.tension_max = 3*np.array(tensions_eq)
 
         print("Tensions")
         print(tensions_eq)
@@ -198,6 +199,11 @@ class PayloadControlMujocoMultiplePointMass(Node):
             "/payload/cable_direction",
             10,
         )
+        self.publisher_cable_manipulability = self.create_publisher(
+            Float64,
+            "/payload/cable_manipulability",
+            10,
+        )
 
         ## Subcriber of each drone
         self.subscriber_drone_1_ = self.create_subscription(Odometry, "/quadrotor1/odom", self.callback_get_odometry_drone_1, 10)
@@ -229,7 +235,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ## Define desired Values 
         self.xd = np.zeros((self.n_x, ), dtype=np.double)
         self.ud = np.zeros((self.n_u, ), dtype=np.double)
-        planner_goal = np.array([0.5, 0.0, 1.0], dtype=np.double)
+        planner_goal = np.array([1.0, 1.0, 1.5], dtype=np.double)
 
         self.reference_plan = plan_three_quad_point_mass(
             p0=pos_0,
@@ -365,6 +371,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.x_0 = np.hstack((x, unit, r))
         self.publish_cable_direction(unit)
         self.publish_cable_angular_velocity(r)
+        self.publish_cable_manipulability(unit)
         #self.try_initialize_reference()
         return None
 
@@ -378,6 +385,17 @@ class PayloadControlMujocoMultiplePointMass(Node):
         msg = Float64MultiArray()
         msg.data = np.asarray(unit, dtype=np.double).reshape((self.robot_num * 3,)).tolist()
         self.publisher_cable_direction.publish(msg)
+        return None
+
+    def cable_direction_manipulability(self, unit: np.ndarray) -> float:
+        N = np.asarray(unit, dtype=np.double).reshape((3, self.robot_num), order="F")
+        manipulability = np.sqrt(max(0.0, float(np.linalg.det(N @ N.T))))
+        return manipulability
+
+    def publish_cable_manipulability(self, unit: np.ndarray):
+        msg = Float64()
+        msg.data = self.cable_direction_manipulability(unit)
+        self.publisher_cable_manipulability.publish(msg)
         return None
 
     def update_reference_from_plan(self, t_query: float):
@@ -799,6 +817,8 @@ class PayloadControlMujocoMultiplePointMass(Node):
         xq1_error = xq1 - xq1_d
         xq2_error = xq2 - xq2_d
         xq3_error = xq3 - xq3_d
+        triple_product = ca.dot(n1, ca.cross(n2, n3))
+        manipulability_expr = ca.sqrt(triple_product * triple_product + self.norm_regularization_eps)
 
 
         #orthogonality_error = ca.dot(n1, r1)
@@ -825,7 +845,8 @@ class PayloadControlMujocoMultiplePointMass(Node):
             + self.weight_r * (r3_error.T @ r3_error)
             + self.weight_acceleration * (a_q1.T @ a_q1)
             + self.weight_acceleration * (a_q2.T @ a_q2)
-            + self.weight_acceleration * (a_q3.T @ a_q3))
+            + self.weight_acceleration * (a_q3.T @ a_q3)
+            - self.weight_manipulability * manipulability_expr)
         #    + self.weight_orthogonality * (orthogonality_error ** 2)
         #)
         ocp.model.cost_expr_ext_cost_e = (
@@ -838,7 +859,8 @@ class PayloadControlMujocoMultiplePointMass(Node):
             + self.weight_quadrotor_position * (xq3_error.T @ xq3_error)
             + self.weight_r * (r1_error.T @ r1_error)
             + self.weight_r * (r2_error.T @ r2_error)
-            + self.weight_r * (r3_error.T @ r3_error))
+            + self.weight_r * (r3_error.T @ r3_error)
+            - self.weight_manipulability * manipulability_expr)
 
         ref_params = np.hstack((self.x_0, self.u_equilibrium))
         cost_params = np.zeros((nx + nx + nu,), dtype=np.double)
@@ -1135,7 +1157,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             xQ[0:3],
             xQ_dot[0:3],
             xQ_dot_dot[0:3],
-            float(tensions[0]),
+            float(tensions[0])*0,
             x_k[6:9],
         )
 
@@ -1144,7 +1166,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             xQ[3:6],
             xQ_dot[3:6],
             xQ_dot_dot[3:6],
-            float(tensions[1]),
+            float(tensions[1])*0,
             x_k[9:12],
         )
 
@@ -1153,7 +1175,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             xQ[6:9],
             xQ_dot[6:9],
             xQ_dot_dot[6:9],
-            float(tensions[2]),
+            float(tensions[2])*0,
             x_k[12:15],
         )
         self.get_logger().info("Solving the MPC problem")
