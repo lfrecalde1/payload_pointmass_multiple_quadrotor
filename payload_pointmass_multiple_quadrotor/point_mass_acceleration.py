@@ -25,16 +25,21 @@ class PayloadControlMujocoMultiplePointMass(Node):
         # Runtime parameters (mirrors dq_nmpc style parameterization).
         self.declare_parameter('planner.ts', 0.05)
         self.declare_parameter('planner.horizon_time', 2.0)
-        self.declare_parameter('nmpc.jerk_limit', [10.0, 10.0, 10.0])
+        self.declare_parameter('nmpc.jerk_limit', [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        self.declare_parameter('model.norm_regularization_eps', 1e-8)
+        self.declare_parameter('model.unit_vector_stabilization_gain', 5.0)
+        self.declare_parameter('model.angular_orthogonality_gain', 5.0)
 
         # Time Definition
-        self.ts = float(self.get_parameter('planner.ts').value)
-        self.final = 30
+        self.t_N = 1.5
+        self.N_prediction = int(31)
+        self.ts = self.t_N / self.N_prediction
+
+        self.norm_regularization_eps = float(self.get_parameter('model.norm_regularization_eps').value)
+        self.unit_vector_stabilization_gain = float(self.get_parameter('model.unit_vector_stabilization_gain').value)
+        self.angular_orthogonality_gain = float(self.get_parameter('model.angular_orthogonality_gain').value)
 
         # Prediction Node of the NMPC formulation
-        self.t_N = float(self.get_parameter('planner.horizon_time').value)
-        self.N = np.arange(0, self.t_N + self.ts, self.ts)
-        self.N_prediction = self.N.shape[0]
         print(self.N_prediction)
 
         # Internal parameters defintion
@@ -47,8 +52,18 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.mass_quad = 1.24
 
         # Cable length
-        self.length = 0.76
+        self.length = 0.75
         self.e3 = ca.DM([0, 0, 1])
+
+        ## Gains Controller 
+        self.kp_min = 10.0
+        self.kv_min = 1.0
+        self.weight_cable_direction = 1.0
+        self.weight_r = 1.0
+        self.weight_acceleration = 1.0
+        self.norm_constraint_slack_weight = 10.0
+        self.unit_vector_norm_tol = 1e-3
+
 
         ## Compute the initial tension based on the the Wrench
         # Position of the system payload
@@ -116,8 +131,14 @@ class PayloadControlMujocoMultiplePointMass(Node):
             gravity=self.gravity,
             q_eq_list=q_eq_list,
         )
+
+        self.tension_min = 0.8*np.array(tensions_eq)
+        self.tension_max = 5*np.array(tensions_eq)
+
         print("Tensions")
         print(tensions_eq)
+        print(self.tension_min)
+        print(self.tension_max)
         print("Cable direciton")
         print(self.n_init)
         
@@ -132,23 +153,28 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ).reshape((self.robot_num * 3,))
 
         ## Init states for the optimizer
-        self.aq_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
+        self.aq1_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
+        self.aq2_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
+        self.aq3_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
+
         self.x_0 = np.hstack((pos_0, vel_0, self.n_init, self.r_init))
-        print(self.x_0)
 
 
         ## Acceleration input and acceleration-state initialization.
-        self.u_equilibrium = np.array([0.0, 0.0, 0.0], dtype=np.double)
+        self.u_equilibrium = np.array([0.0, 0.0, 0.0]*self.robot_num, dtype=np.double)
 
         ## Bounds for jerk input [m/s^3].
-        self.acceleration_limit = np.array(self.get_parameter('nmpc.jerk_limit').value, dtype=np.double).reshape((3,))
+        self.acceleration_limit = np.array(self.get_parameter('nmpc.jerk_limit').value, dtype=np.double).reshape((3*self.robot_num,))
         self.u_min = -self.acceleration_limit.copy()
         self.u_max = self.acceleration_limit.copy()
 
         ## Define state dimension and control action
         self.n_x = self.x_0.shape[0]
         self.n_u = self.u_equilibrium.shape[0]
-
+        
+        print("Verify payload states and control actions also dimensions")
+        print(self.x_0)
+        print(self.u_equilibrium)
         print(self.n_x)
         print(self.n_u)
 
@@ -173,6 +199,26 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         ## TF We can verify cable direction if they make sense or not
         self.tf_broadcaster = TransformBroadcaster(self)
+
+        ## Casadi Model multiple quadrotor and paylaod
+        self.flag = 0
+        self.code_export_directory ="c_generated_code"
+        self.json_file = "acados_ocp_planner_payload_pointmass_multiple.json"
+
+        ## Define desired Values 
+        self.xd = np.zeros((self.n_x, ), dtype=np.double)
+
+        self.xd[0] = 1.0
+        self.xd[1] = 1.0
+        self.xd[2] = 1.0
+
+        self.xd[3] = 0.0
+        self.xd[4] = 0.0
+        self.xd[5] = 0.0
+
+        self.xd[6:15] = self.n_init
+        self.xd[15:24] = self.r_init
+        self.ud = np.zeros((self.n_u, ), dtype=np.double)
 
         self.timer = self.create_timer(self.ts, self.run)
 
@@ -203,7 +249,8 @@ class PayloadControlMujocoMultiplePointMass(Node):
         cols = []
         for k in range(self.robot_num):
             term = x_p - xq_p[:, k]
-            n_k      = (term/ca.norm_2(term))
+            norm_term = ca.sqrt(ca.dot(term, term) + self.norm_regularization_eps)
+            n_k = term / norm_term
             cols.append(n_k)
         quad_payload_mat = ca.hcat(cols)             # 3 x m
         quad_payload_vec = ca.reshape(quad_payload_mat, 3*self.robot_num, 1)  # (3m) x 1
@@ -229,14 +276,15 @@ class PayloadControlMujocoMultiplePointMass(Node):
         for k in range(self.robot_num):
             term = x_p - xQ_p_matrix[:, k]
             # Cable Direction
-            n_k      = (term/ca.norm_2(term))
+            norm_term = ca.sqrt(ca.dot(term, term) + self.norm_regularization_eps)
+            n_k = term / norm_term
 
             x_Q = xQ_p_matrix[:, k]
             v_Q = xQ_v_matrix[:, k]
 
             a = x_p - x_Q
-            norm_a = ca.norm_2(a)
-            dot_a = a.T@a
+            norm_a = ca.sqrt(ca.dot(a, a) + self.norm_regularization_eps)
+            dot_a = ca.dot(a, a) + self.norm_regularization_eps
             I = ca.MX.eye(3)
             a_dot = v_p - v_Q
 
@@ -297,9 +345,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.publish_cable_direction(unit)
         self.publish_cable_angular_velocity(r)
         #self.try_initialize_reference()
-
-        arr_str = np.array2string(self.x_0, precision=3, separator=', ', suppress_small=True)
-        self.get_logger().info(f"x_0 = {arr_str}")
         return None
 
     def publish_cable_angular_velocity(self, r: np.ndarray):
@@ -503,8 +548,342 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         self.tf_broadcaster.sendTransform([tf_world_load, tf_world_quad1, tf_world_load_verification, tf_world_load_verification_2, tf_world_load_verification_3, tf_world_quad2, tf_world_quad3])
         return None
+
+    def payloadModel(self) -> AcadosModel:
+        model_name = "planner_payload_pointmass_multiple"
+        p_x = ca.MX.sym("p_x")
+        p_y = ca.MX.sym("p_y")
+        p_z = ca.MX.sym("p_z")
+        x_p = ca.vertcat(p_x, p_y, p_z)
+
+        vx_p = ca.MX.sym("vx_p")
+        vy_p = ca.MX.sym("vy_p")
+        vz_p = ca.MX.sym("vz_p")
+        v_p = ca.vertcat(vx_p, vy_p, vz_p)
+
+        # Cable kinematics
+        nx_1 = ca.MX.sym('nx_1')
+        ny_1 = ca.MX.sym('ny_1')
+        nz_1 = ca.MX.sym('nz_1')
+        n1 = ca.vertcat(nx_1, ny_1, nz_1)
+
+        nx_2 = ca.MX.sym('nx_2')
+        ny_2 = ca.MX.sym('ny_2')
+        nz_2 = ca.MX.sym('nz_2')
+        n2 = ca.vertcat(nx_2, ny_2, nz_2)
+
+        nx_3 = ca.MX.sym('nx_3')
+        ny_3 = ca.MX.sym('ny_3')
+        nz_3 = ca.MX.sym('nz_3')
+        n3 = ca.vertcat(nx_3, ny_3, nz_3)
+
+        # Cable kinematics
+        rx_1 = ca.MX.sym('rx_1')
+        ry_1 = ca.MX.sym('ry_1')
+        rz_1 = ca.MX.sym('rz_1')
+        r1 = ca.vertcat(rx_1, ry_1, rz_1)
+
+        rx_2 = ca.MX.sym('rx_2')
+        ry_2 = ca.MX.sym('ry_2')
+        rz_2 = ca.MX.sym('rz_2')
+        r2 = ca.vertcat(rx_2, ry_2, rz_2)
+
+        rx_3 = ca.MX.sym('rx_3')
+        ry_3 = ca.MX.sym('ry_3')
+        rz_3 = ca.MX.sym('rz_3')
+        r3 = ca.vertcat(rx_3, ry_3, rz_3)
+        
+        # Full states of the system
+        x = ca.vertcat(x_p, v_p, n1, n2, n3, r1, r2, r3)
+        
+        # Control actions acceleration of each quadrotor
+        ax_q1 = ca.MX.sym("ax_q1")
+        ay_q1 = ca.MX.sym("ay_q1")
+        az_q1 = ca.MX.sym("az_q1")
+        a_1 = ca.vertcat(ax_q1, ay_q1, az_q1)
+
+        ax_q2 = ca.MX.sym("ax_q2")
+        ay_q2 = ca.MX.sym("ay_q2")
+        az_q2 = ca.MX.sym("az_q2")
+        a_2 = ca.vertcat(ax_q2, ay_q2, az_q2)
+
+        ax_q3 = ca.MX.sym("ax_q3")
+        ay_q3 = ca.MX.sym("ay_q3")
+        az_q3 = ca.MX.sym("az_q3")
+        a_3 = ca.vertcat(ax_q3, ay_q3, az_q3)
+        u = ca.vertcat(a_1, a_2, a_3)
+        
+        # Matrix of cable directions
+        N = ca.hcat([n1, n2, n3])
+
+        # Matrix of cable angular velocities
+        W = ca.hcat([r1, r2, r3])
+
+        # Matrix of control actions
+        U = ca.hcat([a_1, a_2, a_3])
+
+        d_1 = ca.dot(N[:, 0], U[:, 0]) - self.length * ca.dot(W[:, 0], W[:, 0])
+        d_2 = ca.dot(N[:, 1], U[:, 1]) - self.length * ca.dot(W[:, 1], W[:, 1])
+        d_3 = ca.dot(N[:, 2], U[:, 2]) - self.length * ca.dot(W[:, 2], W[:, 2])
+
+        
+        m = self.mass
+        I3 = ca.MX.eye(3)
+        z = ca.MX.zeros(1, 1)
+        M = ca.vertcat(
+            ca.hcat([m * I3, n1, n2, n3]),
+            ca.hcat([n1.T, z, z, z]),
+            ca.hcat([n2.T, z, z, z]),
+            ca.hcat([n3.T, z, z, z]),
+        )
+
+
+
+        linear_velocity = v_p
+        gravity_vec = self.gravity * self.e3
+        gravity_vec_mass = -m*self.gravity * self.e3
+
+        b = ca.vertcat(gravity_vec_mass, d_1, d_2, d_3)
+
+        acceleration_tension = ca.solve(M, b)
+
+        linear_acceleration = acceleration_tension[0:3]
+        tensions_expresion = acceleration_tension[3:6]
+
+        k_n = self.unit_vector_stabilization_gain
+        k_r = self.angular_orthogonality_gain
+        a_p = acceleration_tension[0:3]
+
+        n1_dot = ca.cross(r1, n1)
+        r1_dot = (1.0 / self.length) * ca.cross(n1, (a_p - U[:, 0]))
+
+        n2_dot = ca.cross(r2, n2)
+        r2_dot = (1.0 / self.length) * ca.cross(n2, (a_p - U[:, 1]))
+
+        n3_dot = ca.cross(r3, n3)
+        r3_dot = (1.0 / self.length) * ca.cross(n3, (a_p - U[:, 2]))
+
+        f_expl = ca.vertcat(linear_velocity, linear_acceleration, n1_dot, n2_dot, n3_dot, r1_dot, r2_dot, r3_dot)
+
+        nx = x.shape[0]
+        x_dot = ca.MX.sym("x_dot", nx, 1)
+        f_impl_expr = x_dot - f_expl
+
+        ref_params = ca.MX.sym("ref_params", nx + u.shape[0], 1)
+        cost_params = ca.MX.sym("cost_params", nx + nx + u.shape[0], 1)
+
+        model = AcadosModel()
+        model.x = x
+        model.xdot = x_dot
+        model.x_dot = x_dot
+        model.f_expl_expr = f_expl
+        model.f_impl_expr = f_impl_expr
+        model.u = u
+        #model.p = ca.vertcat(ref_params, cost_params)
+        model.p = ref_params
+        model.name = model_name
+        return model, tensions_expresion
+
+    def solver(self, x0):
+        model, tensions_expresion = self.payloadModel()
+
+        ocp = AcadosOcp()
+        ocp.model = model
+        ocp.code_gen_opts.code_export_directory = str(self.code_export_directory)
+
+        nx = model.x.size()[0]
+        nu = model.u.size()[0]
+
+        ocp.dims.N = self.N_prediction
+        ocp.cost.cost_type = "EXTERNAL"
+        ocp.cost.cost_type_e = "EXTERNAL"
+
+        x = ocp.model.x
+        u = ocp.model.u
+        p = ocp.model.p
+        
+        print("OCP DIMENSIONS")
+        print(x.shape)
+        print(u.shape)
+        print(p.shape)
+        
+        ## Split Values from the states and desired states
+        x_p = x[0:3]
+        v_p = x[3:6]
+
+        n1 = x[6:9]
+        n2 = x[9:12]
+        n3 = x[12:15]
+
+        r1 = x[15:18]
+        r2 = x[18:21]
+        r3 = x[21:24]
+        
+        # Split control actions
+        a_q1 = u[0:3]
+        a_q2 = u[3:6]
+        a_q3 = u[6:9]
+        
+        ## Split desired values
+        x_p_d = p[0:3]
+        v_p_d = p[3:6]
+
+        n1_d = p[6:9]
+        n2_d = p[9:12]
+        n3_d = p[12:15]
+
+        r1_d = p[15:18]
+        r2_d = p[18:21]
+        r3_d = p[21:24]
+
+        error_position = x_p - x_p_d
+        error_velocity = v_p - v_p_d
+
+        error_n1 = ca.cross(n1_d, n1)
+        error_n2 = ca.cross(n2_d, n2)
+        error_n3 = ca.cross(n3_d, n3)
+
+        tangent_projector_1 = ca.MX.eye(3) - n1 @ n1.T
+        tangent_projector_2 = ca.MX.eye(3) - n2 @ n2.T
+        tangent_projector_3 = ca.MX.eye(3) - n3 @ n3.T
+
+        r1_error = r1 - tangent_projector_1 @ r1_d
+        r2_error = r2 - tangent_projector_2 @ r2_d
+        r3_error = r3 - tangent_projector_3 @ r3_d
+
+
+        #orthogonality_error = ca.dot(n1, r1)
+        #tension_expr = self.mass * (
+        #    self.length * ca.dot(r1, r1)
+        #    - ca.dot(n1, (a_q + self.gravity * self.e3))
+        #)
+
+        lyapunov_position = (
+            100.0 * self.kp_min * (error_position.T @ error_position)
+            + 0.5 * self.kv_min * self.mass * (error_velocity.T @ error_velocity)
+        )
+
+        ocp.model.cost_expr_ext_cost = (
+            lyapunov_position
+            + self.weight_cable_direction * (error_n1.T @ error_n1)
+            + self.weight_cable_direction * (error_n2.T @ error_n2)
+            + self.weight_cable_direction * (error_n3.T @ error_n3)
+            + self.weight_r * (r1_error.T @ r1_error)
+            + self.weight_r * (r2_error.T @ r2_error)
+            + self.weight_r * (r3_error.T @ r3_error)
+            + self.weight_acceleration * (a_q1.T @ a_q1)
+            + self.weight_acceleration * (a_q2.T @ a_q2)
+            + self.weight_acceleration * (a_q3.T @ a_q3))
+        #    + self.weight_orthogonality * (orthogonality_error ** 2)
+        #)
+        ocp.model.cost_expr_ext_cost_e = (
+            lyapunov_position
+            + self.weight_cable_direction * (error_n1.T @ error_n1)
+            + self.weight_cable_direction * (error_n2.T @ error_n2)
+            + self.weight_cable_direction * (error_n3.T @ error_n3)
+            + self.weight_r * (r1_error.T @ r1_error)
+            + self.weight_r * (r2_error.T @ r2_error)
+            + self.weight_r * (r3_error.T @ r3_error))
+
+        ref_params = np.hstack((self.x_0, self.u_equilibrium))
+        cost_params = np.zeros((nx + nx + nu,), dtype=np.double)
+        #ocp.parameter_values = np.concatenate([ref_params, cost_params])
+        ocp.parameter_values = ref_params
+
+        ocp.constraints.constr_type = "BGH"
+        ocp.constraints.lbu = self.u_min
+        ocp.constraints.ubu = self.u_max
+        ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int32)
+        ocp.constraints.x0 = x0
+
+        ocp.model.con_h_expr = ca.vertcat(
+            ca.dot(n1, n1),
+            ca.dot(n2, n2),
+            ca.dot(n3, n3),
+            tensions_expresion,
+        )
+        nh = 6
+        nsh = nh
+        ocp.cost.zl = self.norm_constraint_slack_weight * np.ones((nsh,))
+        ocp.cost.Zl = self.norm_constraint_slack_weight * np.ones((nsh,))
+        ocp.cost.zu = self.norm_constraint_slack_weight * np.ones((nsh,))
+        ocp.cost.Zu = self.norm_constraint_slack_weight * np.ones((nsh,))
+        ocp.constraints.lh = np.concatenate(
+            (
+                np.full((3,), 1.0 - self.unit_vector_norm_tol, dtype=np.double),
+                np.asarray(self.tension_min, dtype=np.double).reshape((3,)),
+            )
+        )
+        ocp.constraints.uh = np.concatenate(
+            (
+                np.full((3,), 1.0 + self.unit_vector_norm_tol, dtype=np.double),
+                np.asarray(self.tension_max, dtype=np.double).reshape((3,)),
+            )
+        )
+        ocp.constraints.lsh = np.zeros((nsh,))
+        ocp.constraints.ush = np.zeros((nsh,))
+        ocp.constraints.idxsh = np.array(range(nsh), dtype=np.int32)
+
+        ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
+        ocp.solver_options.qp_solver_cond_N = self.N_prediction
+        ocp.solver_options.hessian_approx = "EXACT"
+        ocp.solver_options.integrator_type = "IRK"
+        ocp.solver_options.sim_method_num_stages = 4
+        ocp.solver_options.sim_method_num_steps = 2
+        ocp.solver_options.sim_method_newton_iter = 20
+        ocp.solver_options.sim_method_newton_tol = 1e-10
+        ocp.solver_options.levenberg_marquardt = 1.0
+        ocp.solver_options.nlp_solver_type = "SQP_RTI"
+        ocp.solver_options.nlp_solver_max_iter = 2
+        ocp.solver_options.Tsim = self.ts
+        ocp.solver_options.tf = self.t_N
+        ocp.solver_options.N_horizon = self.N_prediction
+        ocp.solver_options.regularize_method = "CONVEXIFY"
+        return ocp
+
+    def prepare(self):
+        if self.flag == 0:
+            self.flag = 1
+            # Init Optimization Problem
+            for k in range(5000):
+                arr_str = np.array2string(self.x_0, precision=3, separator=", ", suppress_small=True)
+                #self.get_logger().info(f"state[] = {arr_str}")
     
+            self.ocp = self.solver(self.x_0)
+            self.acados_ocp_solver = AcadosOcpSolver(self.ocp, json_file=str(self.json_file), build=True, generate=True)
+            ### Reset Solver
+            self.acados_ocp_solver.reset()
+    
+            ### Initial Conditions optimization problem
+            for stage in range(self.N_prediction + 1):
+                self.acados_ocp_solver.set(stage, "x", self.x_0)
+            for stage in range(self.N_prediction):
+                self.acados_ocp_solver.set(stage, "u", self.ud)
+        return None
+
     def run(self):
+        self.prepare()
+
+        self.acados_ocp_solver.set(0, "lbx", self.x_0)
+        self.acados_ocp_solver.set(0, "ubx", self.x_0)
+
+        # Desired Trajectory of the system
+        for j in range(self.N_prediction):
+            yref = self.xd
+            uref = self.ud
+            aux_ref = np.hstack((yref, uref))
+            self.acados_ocp_solver.set(j, "p", aux_ref)
+        # Desired Trayectory at the last Horizon
+        yref_N = self.xd
+        uref_N = self.ud
+        aux_ref_N = np.hstack((yref_N, uref_N))
+        self.acados_ocp_solver.set(self.N_prediction, "p", aux_ref_N)
+        # Check Solution since there can be possible errors 
+        self.acados_ocp_solver.solve()
+
+        # get Control Actions and predictions
+        u = self.acados_ocp_solver.get(0, "u")
+        x_k = self.acados_ocp_solver.get(1, "x")
         self.publish_transforms()
 
 
