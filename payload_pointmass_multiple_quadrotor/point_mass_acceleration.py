@@ -160,6 +160,11 @@ class PayloadControlMujocoMultiplePointMass(Node):
             "/payload/cable_angular_velocity",
             10,
         )
+        self.publisher_cable_direction = self.create_publisher(
+            Float64MultiArray,
+            "/payload/cable_direction",
+            10,
+        )
 
         ## Subcriber of each drone
         self.subscriber_drone_1_ = self.create_subscription(Odometry, "/quadrotor1/odom", self.callback_get_odometry_drone_1, 10)
@@ -174,7 +179,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
     def build_hover_equilibrium_lambdas(self, payload_mass: float, gravity: float, q_eq_list: List[np.ndarray]):
         N = np.column_stack(q_eq_list)  # 3x3
-        print(N)
         rhs = -payload_mass * gravity * np.array(self.e3, dtype=np.double).reshape((3,))
         tensions = np.linalg.solve(N, rhs)
 
@@ -290,6 +294,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ).reshape((self.robot_num * 3,))
 
         self.x_0 = np.hstack((x, unit, r))
+        self.publish_cable_direction(unit)
         self.publish_cable_angular_velocity(r)
         #self.try_initialize_reference()
 
@@ -301,6 +306,12 @@ class PayloadControlMujocoMultiplePointMass(Node):
         msg = Float64MultiArray()
         msg.data = np.asarray(r, dtype=np.double).reshape((self.robot_num * 3,)).tolist()
         self.publisher_cable_angular_velocity.publish(msg)
+        return None
+
+    def publish_cable_direction(self, unit: np.ndarray):
+        msg = Float64MultiArray()
+        msg.data = np.asarray(unit, dtype=np.double).reshape((self.robot_num * 3,)).tolist()
+        self.publisher_cable_direction.publish(msg)
         return None
 
     def callback_get_odometry_drone_1(self, msg):
