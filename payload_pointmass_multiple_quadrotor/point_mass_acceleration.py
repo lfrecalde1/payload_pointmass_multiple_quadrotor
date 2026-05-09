@@ -17,7 +17,14 @@ from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float64, Float64MultiArray
 from typing import Dict, List
-from payload_pointmass_multiple_quadrotor.lim_min_multiple_simple import plan_three_quad_point_mass
+from payload_pointmass_multiple_quadrotor.lim_min_multiple_simple import (
+    ACCELS_PLOT_PATH,
+    HAS_MPL,
+    SIGNALS_PLOT_PATH,
+    plan_three_quad_point_mass,
+    plot_signal_diagnostics,
+    verify_smoothness,
+)
 
 class PayloadControlMujocoMultiplePointMass(Node):
     def __init__(self):
@@ -56,17 +63,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         # Cable length
         self.length = 0.76
         self.e3 = ca.DM([0, 0, 1])
-
-        ## Gains Controller 
-        self.kp_min = 10.0
-        self.kv_min = 5.0
-        self.weight_cable_direction = 10.0
-        self.weight_quadrotor_position = 0.0
-        self.weight_manipulability = 10.0
-        self.weight_r = 0.1
-        self.weight_acceleration = 5.0
-        self.norm_constraint_slack_weight = 10.0
-        self.unit_vector_norm_tol = 1e-3
 
 
         ## Compute the initial tension based on the the Wrench
@@ -140,7 +136,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         )
 
         self.tension_min = 0.2*np.array(tensions_eq)
-        self.tension_max = 3*np.array(tensions_eq)
+        self.tension_max = 10*np.array(tensions_eq)
 
         print("Tensions")
         print(tensions_eq)
@@ -235,18 +231,8 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ## Define desired Values 
         self.xd = np.zeros((self.n_x, ), dtype=np.double)
         self.ud = np.zeros((self.n_u, ), dtype=np.double)
-        planner_goal = np.array([1.0, 1.0, 1.5], dtype=np.double)
+        self.planner_goal = np.array([1.0, 1.0, 0.5], dtype=np.double)
 
-        self.reference_plan = plan_three_quad_point_mass(
-            p0=pos_0,
-            pf=planner_goal,
-            T_total=self.t_N,
-            n_samples=max(self.N_prediction + 1, 201),
-            payload_mass=self.mass,
-            gravity=self.gravity,
-            cable_lengths=np.full((self.robot_num,), self.length, dtype=np.double),
-        )
-        self.update_reference_from_plan(0.0)
         self.timer = self.create_timer(self.ts, self.run)
 
 
@@ -412,6 +398,20 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.xd[6:15] = q_ref.reshape((self.robot_num * 3,))
         self.xd[15:24] = r_ref.reshape((self.robot_num * 3,))
         self.ud[:] = self.reference_plan["quad_a"][:, idx, :].reshape((self.robot_num * 3,))
+        return None
+
+    def save_reference_plan_signals(self):
+        smoothness = verify_smoothness(self.reference_plan)
+        self.get_logger().info(
+            "planner smoothness endpoint_ok="
+            + ("true" if bool(smoothness["endpoint_ok"]) else "false")
+        )
+        if HAS_MPL:
+            plot_signal_diagnostics(self.reference_plan)
+            self.get_logger().info(f"saved planner signal diagnostics: {SIGNALS_PLOT_PATH}")
+            self.get_logger().info(f"saved planner acceleration diagnostics: {ACCELS_PLOT_PATH}")
+        else:
+            self.get_logger().warning("matplotlib not available; skipping planner signal plots.")
         return None
 
     def callback_get_odometry_drone_1(self, msg):
@@ -817,54 +817,94 @@ class PayloadControlMujocoMultiplePointMass(Node):
         xq1_error = xq1 - xq1_d
         xq2_error = xq2 - xq2_d
         xq3_error = xq3 - xq3_d
-        triple_product = ca.dot(n1, ca.cross(n2, n3))
-        manipulability_expr = ca.sqrt(triple_product * triple_product + self.norm_regularization_eps)
+
+        ## Gains Controller 
+        self.norm_constraint_slack_weight = 10.0
+        self.unit_vector_norm_tol = 1e-3
+        
+        ## gains for payload
+        self.Kp = ca.MX.zeros(3, 3)
+        self.Kp[0, 0] = 100.0
+        self.Kp[1, 1] = 100.0
+        self.Kp[2, 2] = 350.0
+
+        self.Kv = ca.MX.zeros(3, 3)
+        self.Kv[0, 0] = 1.0
+        self.Kv[1, 1] = 1.0
+        self.Kv[2, 2] = 1.0
+        
+        ## Gains for cable direcitions
+        self.Kp_n1 = ca.MX.zeros(3, 3)
+        self.Kp_n1[0, 0] = 30
+        self.Kp_n1[1, 1] = 30
+        self.Kp_n1[2, 2] = 30
+
+        self.Kp_n2 = ca.MX.zeros(3, 3)
+        self.Kp_n2[0, 0] = 30
+        self.Kp_n2[1, 1] = 30
+        self.Kp_n2[2, 2] = 30
+
+        self.Kp_n3 = ca.MX.zeros(3, 3)
+        self.Kp_n3[0, 0] = 30
+        self.Kp_n3[1, 1] = 30
+        self.Kp_n3[2, 2] = 30
+
+        # Gains for cable angular velocity
+        self.Kp_r1 = ca.MX.zeros(3, 3)
+        self.Kp_r1[0, 0] = 30
+        self.Kp_r1[1, 1] = 30
+        self.Kp_r1[2, 2] = 30
+
+        self.Kp_r2 = ca.MX.zeros(3, 3)
+        self.Kp_r2[0, 0] = 30
+        self.Kp_r2[1, 1] = 30
+        self.Kp_r2[2, 2] = 30
+
+        self.Kp_r3 = ca.MX.zeros(3, 3)
+        self.Kp_r3[0, 0] = 30
+        self.Kp_r3[1, 1] = 30
+        self.Kp_r3[2, 2] = 30
+
+        self.R_q1 = ca.MX.zeros(3, 3)
+        self.R_q1[0, 0] = 0.1
+        self.R_q1[1, 1] = 0.1
+        self.R_q1[2, 2] = 0.1
+
+        self.R_q2 = ca.MX.zeros(3, 3)
+        self.R_q2[0, 0] = 0.1
+        self.R_q2[1, 1] = 0.1
+        self.R_q2[2, 2] = 0.1
+
+        self.R_q3 = ca.MX.zeros(3, 3)
+        self.R_q3[0, 0] = 0.1
+        self.R_q3[1, 1] = 0.1
+        self.R_q3[2, 2] = 0.1
 
 
-        #orthogonality_error = ca.dot(n1, r1)
-        #tension_expr = self.mass * (
-        #    self.length * ca.dot(r1, r1)
-        #    - ca.dot(n1, (a_q + self.gravity * self.e3))
-        #)
-
-        lyapunov_position = (
-            100.0 * self.kp_min * (error_position.T @ error_position)
-            + 0.5 * self.kv_min * self.mass * (error_velocity.T @ error_velocity)
-        )
+        lyapunov_position = ((error_position.T @ self.Kp @ error_position) + self.mass * (error_velocity.T @ self.Kv @ error_velocity))
 
         ocp.model.cost_expr_ext_cost = (
             lyapunov_position
-            + self.weight_cable_direction * (error_n1.T @ error_n1)
-            + self.weight_cable_direction * (error_n2.T @ error_n2)
-            + self.weight_cable_direction * (error_n3.T @ error_n3)
-            + self.weight_quadrotor_position * (xq1_error.T @ xq1_error)
-            + self.weight_quadrotor_position * (xq2_error.T @ xq2_error)
-            + self.weight_quadrotor_position * (xq3_error.T @ xq3_error)
-            + self.weight_r * (r1_error.T @ r1_error)
-            + self.weight_r * (r2_error.T @ r2_error)
-            + self.weight_r * (r3_error.T @ r3_error)
-            + self.weight_acceleration * (a_q1.T @ a_q1)
-            + self.weight_acceleration * (a_q2.T @ a_q2)
-            + self.weight_acceleration * (a_q3.T @ a_q3)
-            - self.weight_manipulability * manipulability_expr)
-        #    + self.weight_orthogonality * (orthogonality_error ** 2)
-        #)
+            + (error_n1.T @ self.Kp_n1 @error_n1)
+            + (error_n2.T @ self.Kp_n2 @error_n2)
+            + (error_n3.T @ self.Kp_n3 @error_n3)
+            + (r1_error.T @ self.Kp_r1 @r1_error)
+            + (r2_error.T @ self.Kp_r2 @r2_error)
+            + (r3_error.T @ self.Kp_r3 @r3_error)
+            + (a_q1.T @ self.R_q1 @a_q1)
+            + (a_q2.T @ self.R_q2 @a_q2)
+            + (a_q3.T @ self.R_q3 @a_q3))
         ocp.model.cost_expr_ext_cost_e = (
             lyapunov_position
-            + self.weight_cable_direction * (error_n1.T @ error_n1)
-            + self.weight_cable_direction * (error_n2.T @ error_n2)
-            + self.weight_cable_direction * (error_n3.T @ error_n3)
-            + self.weight_quadrotor_position * (xq1_error.T @ xq1_error)
-            + self.weight_quadrotor_position * (xq2_error.T @ xq2_error)
-            + self.weight_quadrotor_position * (xq3_error.T @ xq3_error)
-            + self.weight_r * (r1_error.T @ r1_error)
-            + self.weight_r * (r2_error.T @ r2_error)
-            + self.weight_r * (r3_error.T @ r3_error)
-            - self.weight_manipulability * manipulability_expr)
+            + (error_n1.T @ self.Kp_n1 @error_n1)
+            + (error_n2.T @ self.Kp_n2 @error_n2)
+            + (error_n3.T @ self.Kp_n3 @error_n3)
+            + (r1_error.T @ self.Kp_r1 @r1_error)
+            + (r2_error.T @ self.Kp_r2 @r2_error)
+            + (r3_error.T @ self.Kp_r3 @r3_error))
 
         ref_params = np.hstack((self.x_0, self.u_equilibrium))
         cost_params = np.zeros((nx + nx + nu,), dtype=np.double)
-        #ocp.parameter_values = np.concatenate([ref_params, cost_params])
         ocp.parameter_values = ref_params
 
         ocp.constraints.constr_type = "BGH"
@@ -909,7 +949,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ocp.solver_options.sim_method_num_steps = 2
         ocp.solver_options.sim_method_newton_iter = 20
         ocp.solver_options.sim_method_newton_tol = 1e-10
-        ocp.solver_options.levenberg_marquardt = 1.0
+        ocp.solver_options.levenberg_marquardt = 10.0
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
         ocp.solver_options.nlp_solver_max_iter = 2
         ocp.solver_options.Tsim = self.ts
@@ -1088,13 +1128,23 @@ class PayloadControlMujocoMultiplePointMass(Node):
             # Init Optimization Problem
             for k in range(5000):
                 arr_str = np.array2string(self.x_0, precision=3, separator=", ", suppress_small=True)
-                #self.get_logger().info(f"state[] = {arr_str}")
+                self.get_logger().info(f"state[] = {arr_str}")
     
+            self.reference_plan = plan_three_quad_point_mass(
+                p0=self.x_0[0:3],
+                pf=self.planner_goal,
+                T_total=self.t_N,
+                n_samples=max(self.N_prediction + 1, 201),
+                payload_mass=self.mass,
+                gravity=self.gravity,
+                cable_lengths=np.full((self.robot_num,), self.length, dtype=np.double),
+            )
             self.ocp = self.solver(self.x_0)
             self.acados_ocp_solver = AcadosOcpSolver(self.ocp, json_file=str(self.json_file), build=True, generate=True)
             ### Reset Solver
             self.acados_ocp_solver.reset()
-    
+            self.update_reference_from_plan(0.0)
+            self.save_reference_plan_signals()
             ### Initial Conditions optimization problem
             for stage in range(self.N_prediction + 1):
                 self.acados_ocp_solver.set(stage, "x", self.x_0)
