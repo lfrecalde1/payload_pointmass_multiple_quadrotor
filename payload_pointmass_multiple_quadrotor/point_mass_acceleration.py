@@ -4,6 +4,7 @@ from rclpy.node import Node
 import numpy as np
 import casadi as ca
 from casadi import Function
+from pathlib import Path as FilePath
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
@@ -18,13 +19,20 @@ from visualization_msgs.msg import Marker
 from std_msgs.msg import Float64, Float64MultiArray
 from typing import Dict, List
 from payload_pointmass_multiple_quadrotor.lim_min_multiple_simple import (
-    ACCELS_PLOT_PATH,
+    ACCELS_PLOT_PATH as POINT_TO_POINT_ACCELS_PLOT_PATH,
     HAS_MPL,
-    SIGNALS_PLOT_PATH,
+    SIGNALS_PLOT_PATH as POINT_TO_POINT_SIGNALS_PLOT_PATH,
     plan_three_quad_point_mass,
     plot_signal_diagnostics,
     verify_smoothness,
 )
+from payload_pointmass_multiple_quadrotor.lissajous_multiple_simple import (
+    ACCELS_PLOT_PATH as LISSAJOUS_ACCELS_PLOT_PATH,
+    SIGNALS_PLOT_PATH as LISSAJOUS_SIGNALS_PLOT_PATH,
+    plan_three_quad_lissajous_payload,
+)
+if HAS_MPL:
+    import matplotlib.pyplot as plt
 
 class PayloadControlMujocoMultiplePointMass(Node):
     def __init__(self):
@@ -36,8 +44,16 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.t_N = 1.5
         self.N_prediction = int(31)
         self.ts = self.t_N / self.N_prediction
+        self.planner_duration = 5.0
+        self.planner_type = "lissajous"
 
         self.reference_start_time = None
+        self.results_saved = False
+        self.tracking_log = []
+        self.tracking_npz_path = FilePath(__file__).with_name("controller_tracking_results.npz")
+        self.tracking_plot_path = FilePath(__file__).with_name("controller_tracking_comparison.png")
+        self.reference_plan_signals_path = POINT_TO_POINT_SIGNALS_PLOT_PATH
+        self.reference_plan_accels_path = POINT_TO_POINT_ACCELS_PLOT_PATH
 
         # Prediction Node of the NMPC formulation
         print(self.N_prediction)
@@ -144,7 +160,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.u_equilibrium = np.array([0.0, 0.0, 0.0]*self.robot_num, dtype=np.double)
 
         ## Bounds for jerk input [m/s^3].
-        self.acceleration_limit = np.array([5.0, 5.0, 5.0]*self.robot_num, dtype=np.double)
+        self.acceleration_limit = np.array([20.0, 20.0, 20.0]*self.robot_num, dtype=np.double)
         self.u_min = -self.acceleration_limit.copy()
         self.u_max = self.acceleration_limit.copy()
 
@@ -203,7 +219,17 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ## Define desired Values 
         self.xd = np.zeros((self.n_x, ), dtype=np.double)
         self.ud = np.zeros((self.n_u, ), dtype=np.double)
-        self.planner_goal = np.array([1.0, 1.0, 0.3], dtype=np.double)
+        self.planner_goal = np.array([5.0, 1.2, 0.3], dtype=np.double)
+        self.lissajous_offset = pos_0.copy()
+        self.lissajous_x_amp = 3.0
+        self.lissajous_y_amp = 0.5
+        self.lissajous_z_amp = 0.5
+        self.lissajous_period = 6.0
+        self.lissajous_num_cycles = 2.0
+        self.lissajous_ramp_time = 3.0
+        self.lissajous_x_num_periods = 1.0
+        self.lissajous_y_num_periods = 2.0
+        self.lissajous_z_num_periods = 1.0
 
         self.timer = self.create_timer(self.ts, self.run)
 
@@ -341,21 +367,62 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.publisher_cable_direction.publish(msg)
         return None
 
-    def update_reference_from_plan(self, t_query: float):
+    def reference_from_plan(self, t_query: float):
         times = self.reference_plan["t"]
         idx = int(np.clip(np.searchsorted(times, t_query, side="left"), 0, len(times) - 1))
 
-        self.xd[0:3] = self.reference_plan["payload_p"][idx]
-        self.xd[3:6] = self.reference_plan["payload_v"][idx]
+        xd = np.zeros((self.n_x,), dtype=np.double)
+        ud = np.zeros((self.n_u,), dtype=np.double)
+
+        xd[0:3] = self.reference_plan["payload_p"][idx]
+        xd[3:6] = self.reference_plan["payload_v"][idx]
 
         q_ref = self.reference_plan["q"][:, idx, :]
         qdot_ref = self.reference_plan["qdot"][:, idx, :]
         r_ref = np.cross(q_ref, qdot_ref)
 
-        self.xd[6:15] = q_ref.reshape((self.robot_num * 3,))
-        self.xd[15:24] = r_ref.reshape((self.robot_num * 3,))
-        self.ud[:] = self.reference_plan["quad_a"][:, idx, :].reshape((self.robot_num * 3,))
+        xd[6:15] = q_ref.reshape((self.robot_num * 3,))
+        xd[15:24] = r_ref.reshape((self.robot_num * 3,))
+        ud[:] = self.reference_plan["quad_a"][:, idx, :].reshape((self.robot_num * 3,))
+        return xd, ud
+
+    def update_reference_from_plan(self, t_query: float):
+        self.xd, self.ud = self.reference_from_plan(t_query)
         return None
+
+    def build_reference_plan(self):
+        common_kwargs = {
+            "n_samples": max(self.N_prediction + 1, 201),
+            "payload_mass": self.mass,
+            "gravity": self.gravity,
+            "cable_lengths": np.full((self.robot_num,), self.length, dtype=np.double),
+        }
+
+        if self.planner_type == "lissajous":
+            self.reference_plan_signals_path = LISSAJOUS_SIGNALS_PLOT_PATH
+            self.reference_plan_accels_path = LISSAJOUS_ACCELS_PLOT_PATH
+            return plan_three_quad_lissajous_payload(
+                offset=np.asarray(self.lissajous_offset, dtype=np.double),
+                x_amp=self.lissajous_x_amp,
+                y_amp=self.lissajous_y_amp,
+                z_amp=self.lissajous_z_amp,
+                period=self.lissajous_period,
+                num_cycles=self.lissajous_num_cycles,
+                ramp_time=self.lissajous_ramp_time,
+                x_num_periods=self.lissajous_x_num_periods,
+                y_num_periods=self.lissajous_y_num_periods,
+                z_num_periods=self.lissajous_z_num_periods,
+                **common_kwargs,
+            )
+
+        self.reference_plan_signals_path = POINT_TO_POINT_SIGNALS_PLOT_PATH
+        self.reference_plan_accels_path = POINT_TO_POINT_ACCELS_PLOT_PATH
+        return plan_three_quad_point_mass(
+            p0=self.x_0[0:3],
+            pf=self.planner_goal,
+            T_total=self.planner_duration,
+            **common_kwargs,
+        )
 
     def save_reference_plan_signals(self):
         smoothness = verify_smoothness(self.reference_plan)
@@ -365,10 +432,129 @@ class PayloadControlMujocoMultiplePointMass(Node):
         )
         if HAS_MPL:
             plot_signal_diagnostics(self.reference_plan)
-            self.get_logger().info(f"saved planner signal diagnostics: {SIGNALS_PLOT_PATH}")
-            self.get_logger().info(f"saved planner acceleration diagnostics: {ACCELS_PLOT_PATH}")
+            if self.planner_type == "lissajous":
+                if POINT_TO_POINT_SIGNALS_PLOT_PATH.exists():
+                    FilePath(self.reference_plan_signals_path).write_bytes(
+                        POINT_TO_POINT_SIGNALS_PLOT_PATH.read_bytes()
+                    )
+                if POINT_TO_POINT_ACCELS_PLOT_PATH.exists():
+                    FilePath(self.reference_plan_accels_path).write_bytes(
+                        POINT_TO_POINT_ACCELS_PLOT_PATH.read_bytes()
+                    )
+            self.get_logger().info(f"saved planner signal diagnostics: {self.reference_plan_signals_path}")
+            self.get_logger().info(f"saved planner acceleration diagnostics: {self.reference_plan_accels_path}")
         else:
             self.get_logger().warning("matplotlib not available; skipping planner signal plots.")
+        return None
+
+    def log_tracking_sample(self, t_now: float, control_u: np.ndarray):
+        self.tracking_log.append({
+            "t": float(t_now),
+            "payload_pos": self.x_0[0:3].copy(),
+            "payload_vel": self.x_0[3:6].copy(),
+            "cable_dir": self.x_0[6:15].copy(),
+            "cable_ang_vel": self.x_0[15:24].copy(),
+            "payload_pos_des": self.xd[0:3].copy(),
+            "payload_vel_des": self.xd[3:6].copy(),
+            "cable_dir_des": self.xd[6:15].copy(),
+            "cable_ang_vel_des": self.xd[15:24].copy(),
+            "control_u": np.asarray(control_u, dtype=np.double).reshape((self.n_u,)).copy(),
+        })
+        return None
+
+    def save_tracking_results(self):
+        if self.results_saved or not self.tracking_log:
+            return None
+
+        data = {
+            "t": np.array([sample["t"] for sample in self.tracking_log], dtype=np.double),
+            "payload_pos": np.vstack([sample["payload_pos"] for sample in self.tracking_log]),
+            "payload_vel": np.vstack([sample["payload_vel"] for sample in self.tracking_log]),
+            "cable_dir": np.vstack([sample["cable_dir"] for sample in self.tracking_log]),
+            "cable_ang_vel": np.vstack([sample["cable_ang_vel"] for sample in self.tracking_log]),
+            "payload_pos_des": np.vstack([sample["payload_pos_des"] for sample in self.tracking_log]),
+            "payload_vel_des": np.vstack([sample["payload_vel_des"] for sample in self.tracking_log]),
+            "cable_dir_des": np.vstack([sample["cable_dir_des"] for sample in self.tracking_log]),
+            "cable_ang_vel_des": np.vstack([sample["cable_ang_vel_des"] for sample in self.tracking_log]),
+            "control_u": np.vstack([sample["control_u"] for sample in self.tracking_log]),
+        }
+        np.savez(self.tracking_npz_path, **data)
+
+        if HAS_MPL:
+            fig, axes = plt.subplots(13, 3, figsize=(16, 38), sharex=True)
+            labels = ("x", "y", "z")
+
+            for axis in range(3):
+                axes[0, axis].plot(data["t"], data["payload_pos"][:, axis], label="actual")
+                axes[0, axis].plot(data["t"], data["payload_pos_des"][:, axis], "--", label="desired")
+                axes[0, axis].set_title(f"payload position {labels[axis]}")
+                axes[0, axis].grid(True, alpha=0.3)
+                if axis == 0:
+                    axes[0, axis].legend()
+
+                axes[1, axis].plot(data["t"], data["payload_vel"][:, axis], label="actual")
+                axes[1, axis].plot(data["t"], data["payload_vel_des"][:, axis], "--", label="desired")
+                axes[1, axis].set_title(f"payload velocity {labels[axis]}")
+                axes[1, axis].grid(True, alpha=0.3)
+
+            cable_labels = [("q1", slice(0, 3)), ("q2", slice(3, 6)), ("q3", slice(6, 9))]
+            for cable_idx, (name, slc) in enumerate(cable_labels):
+                dir_actual = data["cable_dir"][:, slc]
+                dir_des = data["cable_dir_des"][:, slc]
+                ang_actual = data["cable_ang_vel"][:, slc]
+                ang_des = data["cable_ang_vel_des"][:, slc]
+
+                row_dir = 2 + 2 * cable_idx
+                row_ang = row_dir + 1
+
+                for axis in range(3):
+                    axes[row_dir, axis].plot(data["t"], dir_actual[:, axis], label="actual")
+                    axes[row_dir, axis].plot(data["t"], dir_des[:, axis], "--", label="desired")
+                    axes[row_dir, axis].set_title(f"{name} direction {labels[axis]}")
+                    axes[row_dir, axis].grid(True, alpha=0.3)
+                    if axis == 0:
+                        axes[row_dir, axis].legend()
+
+                    axes[row_ang, axis].plot(data["t"], ang_actual[:, axis], label="actual")
+                    axes[row_ang, axis].plot(data["t"], ang_des[:, axis], "--", label="desired")
+                    axes[row_ang, axis].set_title(f"{name} angular velocity {labels[axis]}")
+                    axes[row_ang, axis].grid(True, alpha=0.3)
+                    if axis == 0:
+                        axes[row_ang, axis].legend()
+
+            for axis, (name, slc) in enumerate(cable_labels):
+                axes[8, axis].plot(
+                    data["t"],
+                    np.linalg.norm(data["cable_dir"][:, slc] - data["cable_dir_des"][:, slc], axis=1),
+                )
+                axes[8, axis].set_title(f"{name} direction error norm")
+                axes[8, axis].grid(True, alpha=0.3)
+
+                axes[9, axis].plot(
+                    data["t"],
+                    np.linalg.norm(data["cable_ang_vel"][:, slc] - data["cable_ang_vel_des"][:, slc], axis=1),
+                )
+                axes[9, axis].set_title(f"{name} angular-velocity error norm")
+                axes[9, axis].grid(True, alpha=0.3)
+
+            control_labels = [("u1", slice(0, 3)), ("u2", slice(3, 6)), ("u3", slice(6, 9))]
+            for control_idx, (name, slc) in enumerate(control_labels):
+                control_values = data["control_u"][:, slc]
+                row = 10 + control_idx
+                for axis in range(3):
+                    axes[row, axis].plot(data["t"], control_values[:, axis])
+                    axes[row, axis].set_title(f"{name} acceleration cmd {labels[axis]}")
+                    axes[row, axis].grid(True, alpha=0.3)
+                    axes[row, axis].set_xlabel("time [s]")
+
+            fig.tight_layout()
+            fig.savefig(self.tracking_plot_path, dpi=200)
+            plt.close(fig)
+
+        self.results_saved = True
+        self.get_logger().info(f"saved tracking results: {self.tracking_npz_path}")
+        if HAS_MPL:
+            self.get_logger().info(f"saved tracking plot: {self.tracking_plot_path}")
         return None
 
     def callback_get_odometry_drone_1(self, msg):
@@ -649,8 +835,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
             ca.hcat([n3.T, z, z, z]),
         )
 
-
-
         linear_velocity = v_p
         gravity_vec = self.gravity * self.e3
         gravity_vec_mass = -m*self.gravity * self.e3
@@ -761,79 +945,67 @@ class PayloadControlMujocoMultiplePointMass(Node):
         r2_error = r2 - tangent_projector_2 @ r2_d
         r3_error = r3 - tangent_projector_3 @ r3_d
 
-        xq1 = x_p - self.length * n1
-        xq2 = x_p - self.length * n2
-        xq3 = x_p - self.length * n3
-
-        xq1_d = x_p_d - self.length * n1_d
-        xq2_d = x_p_d - self.length * n2_d
-        xq3_d = x_p_d - self.length * n3_d
-
-        xq1_error = xq1 - xq1_d
-        xq2_error = xq2 - xq2_d
-        xq3_error = xq3 - xq3_d
-
         ## Gains Controller 
         self.norm_constraint_slack_weight = 10.0
         self.unit_vector_norm_tol = 1e-3
         
         ## gains for payload
         self.Kp = ca.MX.zeros(3, 3)
-        self.Kp[0, 0] = 100.0
-        self.Kp[1, 1] = 100.0
-        self.Kp[2, 2] = 100.0
+        self.Kp[0, 0] = 150.0
+        self.Kp[1, 1] = 150.0
+        self.Kp[2, 2] = 150.0
 
         self.Kv = ca.MX.zeros(3, 3)
-        self.Kv[0, 0] = 10.0
-        self.Kv[1, 1] = 10.0
-        self.Kv[2, 2] = 10.0
+        self.Kv[0, 0] = 1.0
+        self.Kv[1, 1] = 1.0
+        self.Kv[2, 2] = 1.0
         
         ## Gains for cable direcitions
         self.Kp_n1 = ca.MX.zeros(3, 3)
-        self.Kp_n1[0, 0] = 30
-        self.Kp_n1[1, 1] = 30
-        self.Kp_n1[2, 2] = 30
+        self.Kp_n1[0, 0] = 50
+        self.Kp_n1[1, 1] = 50
+        self.Kp_n1[2, 2] = 50
 
         self.Kp_n2 = ca.MX.zeros(3, 3)
-        self.Kp_n2[0, 0] = 30
-        self.Kp_n2[1, 1] = 30
-        self.Kp_n2[2, 2] = 30
+        self.Kp_n2[0, 0] = 50
+        self.Kp_n2[1, 1] = 50
+        self.Kp_n2[2, 2] = 50
 
         self.Kp_n3 = ca.MX.zeros(3, 3)
-        self.Kp_n3[0, 0] = 30
-        self.Kp_n3[1, 1] = 30
-        self.Kp_n3[2, 2] = 30
+        self.Kp_n3[0, 0] = 50
+        self.Kp_n3[1, 1] = 50
+        self.Kp_n3[2, 2] = 50
 
         # Gains for cable angular velocity
         self.Kp_r1 = ca.MX.zeros(3, 3)
-        self.Kp_r1[0, 0] = 30
-        self.Kp_r1[1, 1] = 30
-        self.Kp_r1[2, 2] = 30
+        self.Kp_r1[0, 0] = 10
+        self.Kp_r1[1, 1] = 10
+        self.Kp_r1[2, 2] = 10
 
         self.Kp_r2 = ca.MX.zeros(3, 3)
-        self.Kp_r2[0, 0] = 30
-        self.Kp_r2[1, 1] = 30
-        self.Kp_r2[2, 2] = 30
+        self.Kp_r2[0, 0] = 10
+        self.Kp_r2[1, 1] = 10
+        self.Kp_r2[2, 2] = 10
 
         self.Kp_r3 = ca.MX.zeros(3, 3)
-        self.Kp_r3[0, 0] = 30
-        self.Kp_r3[1, 1] = 30
-        self.Kp_r3[2, 2] = 30
+        self.Kp_r3[0, 0] = 10
+        self.Kp_r3[1, 1] = 10
+        self.Kp_r3[2, 2] = 10
 
         self.R_q1 = ca.MX.zeros(3, 3)
-        self.R_q1[0, 0] = 0.1
-        self.R_q1[1, 1] = 0.1
-        self.R_q1[2, 2] = 0.1
+        self.R_q1[0, 0] = 0.01
+        self.R_q1[1, 1] = 0.01
+        self.R_q1[2, 2] = 0.01
 
         self.R_q2 = ca.MX.zeros(3, 3)
-        self.R_q2[0, 0] = 0.1
-        self.R_q2[1, 1] = 0.1
-        self.R_q2[2, 2] = 0.1
+        self.R_q2[0, 0] = 0.01
+        self.R_q2[1, 1] = 0.01
+        self.R_q2[2, 2] = 0.01
 
         self.R_q3 = ca.MX.zeros(3, 3)
-        self.R_q3[0, 0] = 0.1
-        self.R_q3[1, 1] = 0.1
-        self.R_q3[2, 2] = 0.1
+        self.R_q3[0, 0] = 0.01
+        self.R_q3[1, 1] = 0.01
+        self.R_q3[2, 2] = 0.01
 
 
         lyapunov_position = ((error_position.T @ self.Kp @ error_position) + self.mass * (error_velocity.T @ self.Kv @ error_velocity))
@@ -1018,11 +1190,13 @@ class PayloadControlMujocoMultiplePointMass(Node):
         position_cmd_msg.acceleration.y = a[1]
         position_cmd_msg.acceleration.z = a[2]
 
-        cable_force = tension*direction
+        position_cmd_msg.tension = tension
 
-        position_cmd_msg.cable_force.x = cable_force[0]
-        position_cmd_msg.cable_force.y = cable_force[1]
-        position_cmd_msg.cable_force.z = cable_force[2]
+        #cable_force = tension*direction
+
+        #position_cmd_msg.cable_force.x = cable_force[0]
+        #position_cmd_msg.cable_force.y = cable_force[1]
+        #position_cmd_msg.cable_force.z = cable_force[2]
 
         publisher.publish(position_cmd_msg)
         return None
@@ -1079,21 +1253,12 @@ class PayloadControlMujocoMultiplePointMass(Node):
     def prepare(self):
         if self.flag == 0:
             self.flag = 1
-            self.reference_start_time = time.monotonic()
             # Init Optimization Problem
             for k in range(5000):
                 arr_str = np.array2string(self.x_0, precision=3, separator=", ", suppress_small=True)
                 self.get_logger().info(f"state[] = {arr_str}")
     
-            self.reference_plan = plan_three_quad_point_mass(
-                p0=self.x_0[0:3],
-                pf=self.planner_goal,
-                T_total=self.t_N,
-                n_samples=max(self.N_prediction + 1, 201),
-                payload_mass=self.mass,
-                gravity=self.gravity,
-                cable_lengths=np.full((self.robot_num,), self.length, dtype=np.double),
-            )
+            self.reference_plan = self.build_reference_plan()
             self.ocp = self.solver(self.x_0)
             self.acados_ocp_solver = AcadosOcpSolver(self.ocp, json_file=str(self.json_file), build=True, generate=True)
             ### Reset Solver
@@ -1116,7 +1281,11 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         if self.reference_start_time is None:
             self.reference_start_time = time.monotonic()
-        elapsed = min(time.monotonic() - self.reference_start_time, float(self.reference_plan["t"][-1]))
+        current_time = time.monotonic()
+        plan_end_time = float(self.reference_plan["t"][-1])
+        stop_time = self.reference_start_time + plan_end_time + self.ts
+        elapsed_raw = current_time - self.reference_start_time
+        elapsed = min(elapsed_raw, plan_end_time)
         self.update_reference_from_plan(elapsed)
 
         self.acados_ocp_solver.set(0, "lbx", self.x_0)
@@ -1128,15 +1297,18 @@ class PayloadControlMujocoMultiplePointMass(Node):
         for stage in range(self.N_prediction):
             self.acados_ocp_solver.set(stage, "u", self.ud)
 
-        # Desired Trajectory of the system
+        # Desired trajectory over the prediction horizon.
         for j in range(self.N_prediction):
-            yref = self.xd
-            uref = self.ud
+            t_stage = min(elapsed + j * self.ts, float(self.reference_plan["t"][-1]))
+            yref, uref = self.reference_from_plan(t_stage)
+            if j == 0:
+                self.xd = yref.copy()
+                self.ud = uref.copy()
             aux_ref = np.hstack((yref, uref))
             self.acados_ocp_solver.set(j, "p", aux_ref)
-        # Desired Trayectory at the last Horizon
-        yref_N = self.xd
-        uref_N = self.ud
+        # Desired trajectory at the terminal stage.
+        t_terminal = min(elapsed + self.N_prediction * self.ts, float(self.reference_plan["t"][-1]))
+        yref_N, uref_N = self.reference_from_plan(t_terminal)
         aux_ref_N = np.hstack((yref_N, uref_N))
         self.acados_ocp_solver.set(self.N_prediction, "p", aux_ref_N)
         # Check Solution since there can be possible errors 
@@ -1162,7 +1334,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             xQ[0:3],
             xQ_dot[0:3],
             xQ_dot_dot[0:3],
-            float(tensions[0])*0,
+            float(tensions[0]),
             x_k[6:9],
         )
 
@@ -1171,7 +1343,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             xQ[3:6],
             xQ_dot[3:6],
             xQ_dot_dot[3:6],
-            float(tensions[1])*0,
+            float(tensions[1]),
             x_k[9:12],
         )
 
@@ -1180,9 +1352,17 @@ class PayloadControlMujocoMultiplePointMass(Node):
             xQ[6:9],
             xQ_dot[6:9],
             xQ_dot_dot[6:9],
-            float(tensions[2])*0,
+            float(tensions[2]),
             x_k[12:15],
         )
+        self.log_tracking_sample(elapsed, u)
+
+        if current_time >= stop_time:
+            self.save_tracking_results()
+            self.timer.cancel()
+            self.get_logger().info("Controller finished planned trajectory; timer cancelled.")
+            return None
+
         self.get_logger().info("Solving the MPC problem")
         self.publish_transforms()
 
@@ -1195,6 +1375,10 @@ def main(arg = None):
     except KeyboardInterrupt:
         payload_node.get_logger().info('Simulation stopped manually.')
     finally:
+        try:
+            payload_node.save_tracking_results()
+        except Exception as exc:
+            payload_node.get_logger().error(f"Failed to save tracking results on shutdown: {exc}")
         payload_node.destroy_node()
         rclpy.shutdown()
     return None
