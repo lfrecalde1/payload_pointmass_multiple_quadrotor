@@ -31,21 +31,12 @@ class PayloadControlMujocoMultiplePointMass(Node):
         super().__init__('MultiplePointMass')
 
         # Runtime parameters (mirrors dq_nmpc style parameterization).
-        self.declare_parameter('planner.ts', 0.05)
-        self.declare_parameter('planner.horizon_time', 2.0)
-        self.declare_parameter('nmpc.jerk_limit', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-        self.declare_parameter('model.norm_regularization_eps', 1e-8)
-        self.declare_parameter('model.unit_vector_stabilization_gain', 5.0)
-        self.declare_parameter('model.angular_orthogonality_gain', 5.0)
 
         # Time Definition
         self.t_N = 1.5
         self.N_prediction = int(31)
         self.ts = self.t_N / self.N_prediction
 
-        self.norm_regularization_eps = float(self.get_parameter('model.norm_regularization_eps').value)
-        self.unit_vector_stabilization_gain = float(self.get_parameter('model.unit_vector_stabilization_gain').value)
-        self.angular_orthogonality_gain = float(self.get_parameter('model.angular_orthogonality_gain').value)
         self.reference_start_time = None
 
         # Prediction Node of the NMPC formulation
@@ -106,18 +97,16 @@ class PayloadControlMujocoMultiplePointMass(Node):
         # Init Tension of the cables so we can get initial cable direction
         self.init = np.hstack((pos_0, vel_0))
 
-        # Verification direction vectors
 
-        # create functions
         ##  ----------------------------------------------------------------- Funtion Casadi ---------------------------------
         self.payload_to_quadrotor_unit = self.quadrotor_payload_unit_vector_c()
         self.cable_angular_velocity = self.cable_angular_velocity_c()
         self.quadrotors_position = self.quadrotor_position_c()
         self.quadrotors_velocity = self.quadrotor_velocity_c()
         self.tensions = self.cable_tension_c()
-        unit_vectors_init = self.payload_to_quadrotor_unit(pos_0, np.hstack((pos_quad_1, pos_quad_2, pos_quad_3)))
         ##  ----------------------------------------------------------------- Funtion Casadi ---------------------------------
 
+        unit_vectors_init = self.payload_to_quadrotor_unit(pos_0, np.hstack((pos_quad_1, pos_quad_2, pos_quad_3)))
         # This is just the cable direction
         q1_eq = self.normalize(pos_0-pos_quad_1)
         q2_eq = self.normalize(pos_0-pos_quad_2)
@@ -137,13 +126,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
 
         self.tension_min = 0.2*np.array(tensions_eq)
         self.tension_max = 10*np.array(tensions_eq)
-
-        print("Tensions")
-        print(tensions_eq)
-        print(self.tension_min)
-        print(self.tension_max)
-        print("Cable direciton")
-        print(self.n_init)
         
         ## Compute the cable initial angular velocity
         self.r_init = np.array(
@@ -156,18 +138,13 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ).reshape((self.robot_num * 3,))
 
         ## Init states for the optimizer
-        self.aq1_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
-        self.aq2_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
-        self.aq3_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
-
         self.x_0 = np.hstack((pos_0, vel_0, self.n_init, self.r_init))
 
-
-        ## Acceleration input and acceleration-state initialization.
+        ## Acceleration input equilibrium of each quadrotor
         self.u_equilibrium = np.array([0.0, 0.0, 0.0]*self.robot_num, dtype=np.double)
 
         ## Bounds for jerk input [m/s^3].
-        self.acceleration_limit = np.array(self.get_parameter('nmpc.jerk_limit').value, dtype=np.double).reshape((3*self.robot_num,))
+        self.acceleration_limit = np.array([5.0, 5.0, 5.0]*self.robot_num, dtype=np.double)
         self.u_min = -self.acceleration_limit.copy()
         self.u_max = self.acceleration_limit.copy()
 
@@ -193,11 +170,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.publisher_cable_direction = self.create_publisher(
             Float64MultiArray,
             "/payload/cable_direction",
-            10,
-        )
-        self.publisher_cable_manipulability = self.create_publisher(
-            Float64,
-            "/payload/cable_manipulability",
             10,
         )
 
@@ -262,7 +234,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         cols = []
         for k in range(self.robot_num):
             term = x_p - xq_p[:, k]
-            norm_term = ca.sqrt(ca.dot(term, term) + self.norm_regularization_eps)
+            norm_term = ca.sqrt(ca.dot(term, term))
             n_k = term / norm_term
             cols.append(n_k)
         quad_payload_mat = ca.hcat(cols)             # 3 x m
@@ -287,17 +259,18 @@ class PayloadControlMujocoMultiplePointMass(Node):
         # Vectorized expression:
         cols = []
         for k in range(self.robot_num):
-            term = x_p - xQ_p_matrix[:, k]
-            # Cable Direction
-            norm_term = ca.sqrt(ca.dot(term, term) + self.norm_regularization_eps)
-            n_k = term / norm_term
-
             x_Q = xQ_p_matrix[:, k]
             v_Q = xQ_v_matrix[:, k]
 
+            term = x_p - x_Q
+            # Cable Direction
+            norm_term = ca.sqrt(ca.dot(term, term))
+            n_k = term / norm_term
+            
+            # This is for the cable angular velocity
             a = x_p - x_Q
-            norm_a = ca.sqrt(ca.dot(a, a) + self.norm_regularization_eps)
-            dot_a = ca.dot(a, a) + self.norm_regularization_eps
+            norm_a = ca.sqrt(ca.dot(a, a))
+            dot_a = ca.dot(a, a)
             I = ca.MX.eye(3)
             a_dot = v_p - v_Q
 
@@ -345,9 +318,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         # Compute unit Vector
         unit = np.array(self.payload_to_quadrotor_unit(x[0:3], x_quadrotors)).reshape((self.robot_num*3, ))
 
-        # Extended Vector of the Payload
-        payload_states = np.hstack((x, unit))
-
         ## Compute cable angular velocity
         r = np.array(
             self.cable_angular_velocity(x, x_quadrotors, v_quadrotors),
@@ -357,8 +327,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.x_0 = np.hstack((x, unit, r))
         self.publish_cable_direction(unit)
         self.publish_cable_angular_velocity(r)
-        self.publish_cable_manipulability(unit)
-        #self.try_initialize_reference()
         return None
 
     def publish_cable_angular_velocity(self, r: np.ndarray):
@@ -371,17 +339,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         msg = Float64MultiArray()
         msg.data = np.asarray(unit, dtype=np.double).reshape((self.robot_num * 3,)).tolist()
         self.publisher_cable_direction.publish(msg)
-        return None
-
-    def cable_direction_manipulability(self, unit: np.ndarray) -> float:
-        N = np.asarray(unit, dtype=np.double).reshape((3, self.robot_num), order="F")
-        manipulability = np.sqrt(max(0.0, float(np.linalg.det(N @ N.T))))
-        return manipulability
-
-    def publish_cable_manipulability(self, unit: np.ndarray):
-        msg = Float64()
-        msg.data = self.cable_direction_manipulability(unit)
-        self.publisher_cable_manipulability.publish(msg)
         return None
 
     def update_reference_from_plan(self, t_query: float):
@@ -705,8 +662,6 @@ class PayloadControlMujocoMultiplePointMass(Node):
         linear_acceleration = acceleration_tension[0:3]
         tensions_expresion = acceleration_tension[3:6]
 
-        k_n = self.unit_vector_stabilization_gain
-        k_r = self.angular_orthogonality_gain
         a_p = acceleration_tension[0:3]
 
         n1_dot = ca.cross(r1, n1)
