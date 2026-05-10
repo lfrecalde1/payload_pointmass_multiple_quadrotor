@@ -231,7 +231,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         ## Define desired Values 
         self.xd = np.zeros((self.n_x, ), dtype=np.double)
         self.ud = np.zeros((self.n_u, ), dtype=np.double)
-        self.planner_goal = np.array([1.0, 1.0, 0.5], dtype=np.double)
+        self.planner_goal = np.array([1.0, 1.0, 0.3], dtype=np.double)
 
         self.timer = self.create_timer(self.ts, self.run)
 
@@ -826,12 +826,12 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.Kp = ca.MX.zeros(3, 3)
         self.Kp[0, 0] = 100.0
         self.Kp[1, 1] = 100.0
-        self.Kp[2, 2] = 350.0
+        self.Kp[2, 2] = 100.0
 
         self.Kv = ca.MX.zeros(3, 3)
-        self.Kv[0, 0] = 1.0
-        self.Kv[1, 1] = 1.0
-        self.Kv[2, 2] = 1.0
+        self.Kv[0, 0] = 10.0
+        self.Kv[1, 1] = 10.0
+        self.Kv[2, 2] = 10.0
         
         ## Gains for cable direcitions
         self.Kp_n1 = ca.MX.zeros(3, 3)
