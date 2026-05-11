@@ -52,6 +52,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.tracking_log = []
         self.tracking_npz_path = FilePath(__file__).with_name("controller_tracking_results.npz")
         self.tracking_plot_path = FilePath(__file__).with_name("controller_tracking_comparison.png")
+        self.tracking_metrics_plot_path = FilePath(__file__).with_name("controller_tracking_metrics.png")
         self.reference_plan_signals_path = POINT_TO_POINT_SIGNALS_PLOT_PATH
         self.reference_plan_accels_path = POINT_TO_POINT_ACCELS_PLOT_PATH
 
@@ -140,7 +141,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
             q_eq_list=q_eq_list,
         )
 
-        self.tension_min = 0.2*np.array(tensions_eq)
+        self.tension_min = 0.5*np.array(tensions_eq)
         self.tension_max = 10*np.array(tensions_eq)
         
         ## Compute the cable initial angular velocity
@@ -160,7 +161,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.u_equilibrium = np.array([0.0, 0.0, 0.0]*self.robot_num, dtype=np.double)
 
         ## Bounds for jerk input [m/s^3].
-        self.acceleration_limit = np.array([20.0, 20.0, 20.0]*self.robot_num, dtype=np.double)
+        self.acceleration_limit = np.array([50.0, 50.0, 50.0]*self.robot_num, dtype=np.double)
         self.u_min = -self.acceleration_limit.copy()
         self.u_max = self.acceleration_limit.copy()
 
@@ -224,9 +225,9 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.lissajous_x_amp = 3.0
         self.lissajous_y_amp = 0.5
         self.lissajous_z_amp = 0.5
-        self.lissajous_period = 6.0
-        self.lissajous_num_cycles = 2.0
-        self.lissajous_ramp_time = 3.0
+        self.lissajous_period = 4.5
+        self.lissajous_num_cycles = 4.0
+        self.lissajous_ramp_time = 6.0
         self.lissajous_x_num_periods = 1.0
         self.lissajous_y_num_periods = 2.0
         self.lissajous_z_num_periods = 1.0
@@ -448,14 +449,21 @@ class PayloadControlMujocoMultiplePointMass(Node):
         return None
 
     def log_tracking_sample(self, t_now: float, control_u: np.ndarray):
+        quad_vel = np.hstack((self.xq_1[3:6], self.xq_2[3:6], self.xq_3[3:6]))
+        quad_vel_des = np.array(
+            self.quadrotors_velocity(self.xd[3:6], self.xd[6:15], self.xd[15:24]),
+            dtype=np.double,
+        ).reshape((self.robot_num * 3,))
         self.tracking_log.append({
             "t": float(t_now),
             "payload_pos": self.x_0[0:3].copy(),
             "payload_vel": self.x_0[3:6].copy(),
+            "quad_vel": quad_vel.copy(),
             "cable_dir": self.x_0[6:15].copy(),
             "cable_ang_vel": self.x_0[15:24].copy(),
             "payload_pos_des": self.xd[0:3].copy(),
             "payload_vel_des": self.xd[3:6].copy(),
+            "quad_vel_des": quad_vel_des.copy(),
             "cable_dir_des": self.xd[6:15].copy(),
             "cable_ang_vel_des": self.xd[15:24].copy(),
             "control_u": np.asarray(control_u, dtype=np.double).reshape((self.n_u,)).copy(),
@@ -466,22 +474,47 @@ class PayloadControlMujocoMultiplePointMass(Node):
         if self.results_saved or not self.tracking_log:
             return None
 
+        payload_pos = np.vstack([sample["payload_pos"] for sample in self.tracking_log])
+        payload_vel = np.vstack([sample["payload_vel"] for sample in self.tracking_log])
+        quad_vel = np.vstack([sample["quad_vel"] for sample in self.tracking_log])
+        cable_dir = np.vstack([sample["cable_dir"] for sample in self.tracking_log])
+        cable_ang_vel = np.vstack([sample["cable_ang_vel"] for sample in self.tracking_log])
+        payload_pos_des = np.vstack([sample["payload_pos_des"] for sample in self.tracking_log])
+        payload_vel_des = np.vstack([sample["payload_vel_des"] for sample in self.tracking_log])
+        quad_vel_des = np.vstack([sample["quad_vel_des"] for sample in self.tracking_log])
+        cable_dir_des = np.vstack([sample["cable_dir_des"] for sample in self.tracking_log])
+        cable_ang_vel_des = np.vstack([sample["cable_ang_vel_des"] for sample in self.tracking_log])
+        control_u = np.vstack([sample["control_u"] for sample in self.tracking_log])
+
+        payload_position_error = payload_pos - payload_pos_des
+        payload_velocity_error = payload_vel - payload_vel_des
+        payload_position_error_norm = np.linalg.norm(payload_position_error, axis=1)
+        payload_velocity_error_norm = np.linalg.norm(payload_velocity_error, axis=1)
+        payload_position_rmse = float(np.sqrt(np.mean(np.sum(payload_position_error**2, axis=1))))
+        payload_velocity_rmse = float(np.sqrt(np.mean(np.sum(payload_velocity_error**2, axis=1))))
+
         data = {
             "t": np.array([sample["t"] for sample in self.tracking_log], dtype=np.double),
-            "payload_pos": np.vstack([sample["payload_pos"] for sample in self.tracking_log]),
-            "payload_vel": np.vstack([sample["payload_vel"] for sample in self.tracking_log]),
-            "cable_dir": np.vstack([sample["cable_dir"] for sample in self.tracking_log]),
-            "cable_ang_vel": np.vstack([sample["cable_ang_vel"] for sample in self.tracking_log]),
-            "payload_pos_des": np.vstack([sample["payload_pos_des"] for sample in self.tracking_log]),
-            "payload_vel_des": np.vstack([sample["payload_vel_des"] for sample in self.tracking_log]),
-            "cable_dir_des": np.vstack([sample["cable_dir_des"] for sample in self.tracking_log]),
-            "cable_ang_vel_des": np.vstack([sample["cable_ang_vel_des"] for sample in self.tracking_log]),
-            "control_u": np.vstack([sample["control_u"] for sample in self.tracking_log]),
+            "payload_pos": payload_pos,
+            "payload_vel": payload_vel,
+            "quad_vel": quad_vel,
+            "cable_dir": cable_dir,
+            "cable_ang_vel": cable_ang_vel,
+            "payload_pos_des": payload_pos_des,
+            "payload_vel_des": payload_vel_des,
+            "quad_vel_des": quad_vel_des,
+            "cable_dir_des": cable_dir_des,
+            "cable_ang_vel_des": cable_ang_vel_des,
+            "control_u": control_u,
+            "payload_position_error_norm": payload_position_error_norm,
+            "payload_velocity_error_norm": payload_velocity_error_norm,
+            "payload_position_rmse": np.array(payload_position_rmse, dtype=np.double),
+            "payload_velocity_rmse": np.array(payload_velocity_rmse, dtype=np.double),
         }
         np.savez(self.tracking_npz_path, **data)
 
         if HAS_MPL:
-            fig, axes = plt.subplots(13, 3, figsize=(16, 38), sharex=True)
+            fig, axes = plt.subplots(15, 3, figsize=(16, 44), sharex=True)
             labels = ("x", "y", "z")
 
             for axis in range(3):
@@ -537,10 +570,26 @@ class PayloadControlMujocoMultiplePointMass(Node):
                 axes[9, axis].set_title(f"{name} angular-velocity error norm")
                 axes[9, axis].grid(True, alpha=0.3)
 
+            velocity_norm_entries = [
+                ("payload", data["payload_vel"], data["payload_vel_des"]),
+                ("quad 1", data["quad_vel"][:, 0:3], data["quad_vel_des"][:, 0:3]),
+                ("quad 2", data["quad_vel"][:, 3:6], data["quad_vel_des"][:, 3:6]),
+                ("quad 3", data["quad_vel"][:, 6:9], data["quad_vel_des"][:, 6:9]),
+            ]
+            velocity_norm_slots = [(10, 0), (10, 1), (10, 2), (11, 0)]
+            for (name, actual_vel, desired_vel), (row, col) in zip(velocity_norm_entries, velocity_norm_slots):
+                axes[row, col].plot(data["t"], np.linalg.norm(actual_vel, axis=1), label="actual")
+                axes[row, col].plot(data["t"], np.linalg.norm(desired_vel, axis=1), "--", label="desired")
+                axes[row, col].set_title(f"{name} velocity norm")
+                axes[row, col].grid(True, alpha=0.3)
+                axes[row, col].legend()
+            axes[11, 1].axis("off")
+            axes[11, 2].axis("off")
+
             control_labels = [("u1", slice(0, 3)), ("u2", slice(3, 6)), ("u3", slice(6, 9))]
             for control_idx, (name, slc) in enumerate(control_labels):
                 control_values = data["control_u"][:, slc]
-                row = 10 + control_idx
+                row = 12 + control_idx
                 for axis in range(3):
                     axes[row, axis].plot(data["t"], control_values[:, axis])
                     axes[row, axis].set_title(f"{name} acceleration cmd {labels[axis]}")
@@ -551,10 +600,29 @@ class PayloadControlMujocoMultiplePointMass(Node):
             fig.savefig(self.tracking_plot_path, dpi=200)
             plt.close(fig)
 
+            metrics_fig, metrics_axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            metrics_axes[0].plot(data["t"], payload_position_error_norm, label=f"RMSE={payload_position_rmse:.4f} m")
+            metrics_axes[0].set_title("Payload Position Error Norm")
+            metrics_axes[0].set_ylabel("position error [m]")
+            metrics_axes[0].grid(True, alpha=0.3)
+            metrics_axes[0].legend()
+
+            metrics_axes[1].plot(data["t"], payload_velocity_error_norm, label=f"RMSE={payload_velocity_rmse:.4f} m/s")
+            metrics_axes[1].set_title("Payload Velocity Error Norm")
+            metrics_axes[1].set_xlabel("time [s]")
+            metrics_axes[1].set_ylabel("velocity error [m/s]")
+            metrics_axes[1].grid(True, alpha=0.3)
+            metrics_axes[1].legend()
+
+            metrics_fig.tight_layout()
+            metrics_fig.savefig(self.tracking_metrics_plot_path, dpi=200)
+            plt.close(metrics_fig)
+
         self.results_saved = True
         self.get_logger().info(f"saved tracking results: {self.tracking_npz_path}")
         if HAS_MPL:
             self.get_logger().info(f"saved tracking plot: {self.tracking_plot_path}")
+            self.get_logger().info(f"saved tracking metrics plot: {self.tracking_metrics_plot_path}")
         return None
 
     def callback_get_odometry_drone_1(self, msg):
@@ -951,9 +1019,9 @@ class PayloadControlMujocoMultiplePointMass(Node):
         
         ## gains for payload
         self.Kp = ca.MX.zeros(3, 3)
-        self.Kp[0, 0] = 150.0
-        self.Kp[1, 1] = 150.0
-        self.Kp[2, 2] = 150.0
+        self.Kp[0, 0] = 250.0
+        self.Kp[1, 1] = 250.0
+        self.Kp[2, 2] = 250.0
 
         self.Kv = ca.MX.zeros(3, 3)
         self.Kv[0, 0] = 1.0
@@ -962,50 +1030,50 @@ class PayloadControlMujocoMultiplePointMass(Node):
         
         ## Gains for cable direcitions
         self.Kp_n1 = ca.MX.zeros(3, 3)
-        self.Kp_n1[0, 0] = 50
-        self.Kp_n1[1, 1] = 50
-        self.Kp_n1[2, 2] = 50
+        self.Kp_n1[0, 0] = 30
+        self.Kp_n1[1, 1] = 30
+        self.Kp_n1[2, 2] = 30
 
         self.Kp_n2 = ca.MX.zeros(3, 3)
-        self.Kp_n2[0, 0] = 50
-        self.Kp_n2[1, 1] = 50
-        self.Kp_n2[2, 2] = 50
+        self.Kp_n2[0, 0] = 30
+        self.Kp_n2[1, 1] = 30
+        self.Kp_n2[2, 2] = 30
 
         self.Kp_n3 = ca.MX.zeros(3, 3)
-        self.Kp_n3[0, 0] = 50
-        self.Kp_n3[1, 1] = 50
-        self.Kp_n3[2, 2] = 50
+        self.Kp_n3[0, 0] = 30
+        self.Kp_n3[1, 1] = 30
+        self.Kp_n3[2, 2] = 30
 
         # Gains for cable angular velocity
         self.Kp_r1 = ca.MX.zeros(3, 3)
-        self.Kp_r1[0, 0] = 10
-        self.Kp_r1[1, 1] = 10
-        self.Kp_r1[2, 2] = 10
+        self.Kp_r1[0, 0] = 1
+        self.Kp_r1[1, 1] = 1
+        self.Kp_r1[2, 2] = 1
 
         self.Kp_r2 = ca.MX.zeros(3, 3)
-        self.Kp_r2[0, 0] = 10
-        self.Kp_r2[1, 1] = 10
-        self.Kp_r2[2, 2] = 10
+        self.Kp_r2[0, 0] = 1
+        self.Kp_r2[1, 1] = 1
+        self.Kp_r2[2, 2] = 1
 
         self.Kp_r3 = ca.MX.zeros(3, 3)
-        self.Kp_r3[0, 0] = 10
-        self.Kp_r3[1, 1] = 10
-        self.Kp_r3[2, 2] = 10
+        self.Kp_r3[0, 0] = 1
+        self.Kp_r3[1, 1] = 1
+        self.Kp_r3[2, 2] = 1
 
         self.R_q1 = ca.MX.zeros(3, 3)
-        self.R_q1[0, 0] = 0.01
-        self.R_q1[1, 1] = 0.01
-        self.R_q1[2, 2] = 0.01
+        self.R_q1[0, 0] = 0.1
+        self.R_q1[1, 1] = 0.1
+        self.R_q1[2, 2] = 0.1
 
         self.R_q2 = ca.MX.zeros(3, 3)
-        self.R_q2[0, 0] = 0.01
-        self.R_q2[1, 1] = 0.01
-        self.R_q2[2, 2] = 0.01
+        self.R_q2[0, 0] = 0.1
+        self.R_q2[1, 1] = 0.1
+        self.R_q2[2, 2] = 0.1
 
         self.R_q3 = ca.MX.zeros(3, 3)
-        self.R_q3[0, 0] = 0.01
-        self.R_q3[1, 1] = 0.01
-        self.R_q3[2, 2] = 0.01
+        self.R_q3[0, 0] = 0.1
+        self.R_q3[1, 1] = 0.1
+        self.R_q3[2, 2] = 0.1
 
 
         lyapunov_position = ((error_position.T @ self.Kp @ error_position) + self.mass * (error_velocity.T @ self.Kv @ error_velocity))
@@ -1292,10 +1360,10 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.acados_ocp_solver.set(0, "ubx", self.x_0)
 
         # Keep the SQP_RTI iterate close to the current measured state.
-        for stage in range(self.N_prediction + 1):
-            self.acados_ocp_solver.set(stage, "x", self.x_0)
-        for stage in range(self.N_prediction):
-            self.acados_ocp_solver.set(stage, "u", self.ud)
+        #for stage in range(self.N_prediction + 1):
+        #    self.acados_ocp_solver.set(stage, "x", self.x_0)
+        #for stage in range(self.N_prediction):
+        #    self.acados_ocp_solver.set(stage, "u", self.ud)
 
         # Desired trajectory over the prediction horizon.
         for j in range(self.N_prediction):
