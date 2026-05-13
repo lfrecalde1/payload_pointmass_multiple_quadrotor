@@ -225,7 +225,7 @@ class PayloadControlMujocoMultiplePointMass(Node):
         self.lissajous_x_amp = 3.0
         self.lissajous_y_amp = 0.5
         self.lissajous_z_amp = 0.5
-        self.lissajous_period = 4.5
+        self.lissajous_period = 4.0
         self.lissajous_num_cycles = 4.0
         self.lissajous_ramp_time = 6.0
         self.lissajous_x_num_periods = 1.0
